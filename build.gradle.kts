@@ -1,0 +1,232 @@
+plugins {
+	// Applies the correct fabric-loom variant for the active node's
+	// Minecraft version (Yarn-mapped pre-26.1, Mojang-mapped 26.1+).
+	id("dev.kikugie.loom-back-compat")
+	id("maven-publish")
+}
+
+// DO NOT set group here - loom-back-compat needs it set before its own
+// plugin application resolves per-node dependencies.
+group = property("mod.group") as String
+// Dev build (./build-dev.sh or -PveloDev=true): unreleased features from src/dev ride inside the client jar, which is
+// versioned "<version>-dev" so it can never be mistaken for a release. Production builds never see src/dev.
+val veloDev = (findProperty("veloDev") as String?)?.toBoolean() == true
+version = "${property("mod.version")}${if (veloDev) "-dev" else ""}+${sc.current.version}"
+
+base {
+	archivesName.set(property("mod.id") as String)
+}
+
+// 26.1 requires Java 25; everything else this mod supports stays on 21.
+val requiredJava: JavaVersion = if (sc.current.parsed >= "26.1") JavaVersion.VERSION_25 else JavaVersion.VERSION_21
+
+repositories {
+	// Add repositories to retrieve artifacts from in here.
+	// You should only use this when depending on other mods because
+	// Loom adds the essential maven repositories to download Minecraft and libraries from automatically.
+	// See https://docs.gradle.org/current/userguide/declaring_repositories.html
+	// for more information about repositories.
+	exclusiveContent {
+		forRepository { maven("https://api.modrinth.com/maven") { name = "Modrinth" } }
+		filter { includeGroup("maven.modrinth") }
+	}
+	exclusiveContent {
+		forRepository { maven("https://maven.maxhenkel.de/repository/public") { name = "Simple Voice Chat" } }
+		filter { includeGroup("de.maxhenkel.voicechat") }
+	}
+}
+
+loom {
+	splitEnvironmentSourceSets()
+
+	mods {
+		create("velo-client") {
+			sourceSet(sourceSets["main"])
+			sourceSet(sourceSets["client"])
+		}
+	}
+}
+
+fabricApi {
+	configureDataGeneration()
+}
+
+// "Velo Client Addons" - the optional second mod holding the experimental singleplayer/minigame
+// modules (src/addon). Compiled against the core mod's own classes + the same Minecraft/Fabric
+// classpath, but packaged into its own jar (velo-addons-<version>.jar) with its own
+// fabric.mod.json, so players only get those modules if they install that jar too. Stonecutter
+// transforms src/addon per version exactly like src/main and src/client.
+// The Addons are Velo+ only: their source lives in the private repo velo345/velo-client-plus, checked
+// out as the git submodule src/addon. Without access to it (a public clone, CI) src/addon is empty and
+// the Addons simply aren't built - everything else is unaffected.
+val hasAddons = rootProject.file("src/addon/resources/fabric.mod.json").exists()
+
+val addon: SourceSet = sourceSets.create("addon") {
+	compileClasspath += sourceSets["main"].output + sourceSets["client"].output + sourceSets["client"].compileClasspath
+	runtimeClasspath += sourceSets["main"].output + sourceSets["client"].output + sourceSets["client"].runtimeClasspath
+}
+
+// src/dev: features still being built (see veloDev above). Always compiled, so it can't rot, but only packed into the
+// client jar of a dev build.
+val dev: SourceSet = sourceSets.create("dev") {
+	compileClasspath += sourceSets["main"].output + sourceSets["client"].output + sourceSets["client"].compileClasspath
+	runtimeClasspath += sourceSets["main"].output + sourceSets["client"].output + sourceSets["client"].runtimeClasspath
+}
+if (veloDev) {
+	tasks.named<Jar>("jar") { from(dev.output) }
+	// Dev client runs (screenshot tours of dev features) need the dev classes too.
+	tasks.named<JavaExec>("runClient") { classpath(dev.output) }
+	// ...and its resources (pet textures, note art) as part of the mod, not just loose classpath files.
+	loom.mods.named("velo-client") { sourceSet(dev) }
+}
+
+loom {
+	mods {
+		create("velo-addons") {
+			sourceSet(addon)
+		}
+	}
+}
+
+tasks.named<JavaExec>("runClient") {
+	// The dev-run JVM was auto-detecting AWT as headless (no DISPLAY visible
+	// at the moment GraphicsEnvironment first got touched, likely from how
+	// the process gets launched/backgrounded during testing), which made
+	// every Swing-based native file picker (the cape PNG import dialog)
+	// throw HeadlessException instead of opening. Headless auto-detection
+	// only runs once and can't be un-cached later, so it has to be forced
+	// off up front instead.
+	jvmArgs("-Djava.awt.headless=false")
+	// Dev hook: extra JVM flags for the game process only (e.g. a Flight Recorder profile),
+	// without JAVA_TOOL_OPTIONS also hitting the Gradle JVMs.
+	System.getenv("VELO_RUN_JVM_ARGS")?.trim()?.takeIf { it.isNotEmpty() }?.let { jvmArgs(it.split(" ")) }
+}
+
+dependencies {
+	minecraft("com.mojang:minecraft:${sc.current.version}")
+	// Yarn has no published mapping builds for 26.1/26.2 at all (Mojang's
+	// switch to CalVer versioning shipped alongside dropping community
+	// Yarn support in favour of their own official mappings) - everything
+	// this mod already targets (1.21.11) keeps using the proven Yarn build
+	// it shipped with before this multi-version migration.
+	if (sc.current.parsed < "26.1") {
+		mappings("net.fabricmc:yarn:${property("deps.yarn_mappings")}:v2")
+	} else {
+		loomx.applyMojangMappings()
+	}
+	modImplementation("net.fabricmc:fabric-loader:${property("deps.fabric_loader")}")
+	modImplementation("net.fabricmc.fabric-api:fabric-api:${property("deps.fabric_api")}")
+	// Velo Rewind records Simple Voice Chat through its client API (a plugin it calls when installed; nothing happens otherwise).
+	"clientCompileOnly"("de.maxhenkel.voicechat:voicechat-api:2.6.27")
+	// Velo Shaders' shadow pass draws Sodium's chunk meshes a second time from the sun, so it compiles
+	// against Sodium's renderer (compile-only: Sodium itself comes with the launcher's profiles).
+	if (sc.current.version == "26.2") {
+		modCompileOnly("maven.modrinth:sodium:mc26.2-0.9.2-fabric")
+	}
+	if (sc.current.version == "26.3") {
+		// What the launcher installs for 26.3 (the newest Modrinth build).
+		modCompileOnly("maven.modrinth:sodium:mc26.3-0.9.3-beta.1-fabric")
+	}
+}
+
+tasks.named<org.gradle.language.jvm.tasks.ProcessResources>("processResources") {
+	val modVersion = project.version.toString()
+	// fabric.mod.json's own "minecraft" dependency used to be hardcoded to
+	// "~1.21.11" - harmless when this was a single-version project, but it
+	// made Fabric Loader flatly refuse to load the mod on 26.1/26.2 ("only
+	// the wrong version is present"), discovered by actually launching the
+	// 26.1 dev client rather than by compiling (fabric.mod.json isn't
+	// Java, so javac can't catch this class of bug).
+	val minecraftDependency = "~${sc.current.version}"
+	val javaVersion = requiredJava.majorVersion
+	inputs.property("version", modVersion)
+	inputs.property("minecraftDependency", minecraftDependency)
+	inputs.property("javaVersion", javaVersion)
+	// The dev build's own mixins (src/dev/resources/velo-dev.mixins.json) are only listed in a dev jar.
+	val devMixins = if (veloDev && rootProject.file("src/dev/resources/velo-dev.mixins.json").exists()) ",\n\t\t\"velo-dev.mixins.json\"" else ""
+	inputs.property("devMixins", devMixins)
+
+	filesMatching("fabric.mod.json") {
+		expand("version" to modVersion, "minecraft_dependency" to minecraftDependency, "java_version" to javaVersion,
+				"dev_mixins" to devMixins)
+	}
+}
+
+// GPU cosmetics' vertex shaders exist for 26.2/26.3 only. Minecraft reads every shader file of every mod at resource
+// load, and 1.21.x has no minecraft:sample_lightmap.glsl: the import failed, the whole resource reload failed and the
+// game stayed black (Velo 1.2.2 on 1.21.11, 2026-11-07). Older jars don't ship them at all.
+tasks.named<ProcessResources>("processClientResources") {
+	if (sc.current.parsed < "26.2") {
+		exclude("assets/velo-client/shaders/core/cosmetic*.vsh")
+	}
+}
+
+tasks.named<ProcessResources>("processAddonResources") {
+	val modVersion = project.version.toString()
+	val minecraftDependency = "~${sc.current.version}"
+	val javaVersion = requiredJava.majorVersion
+	inputs.property("version", modVersion)
+	inputs.property("minecraftDependency", minecraftDependency)
+	inputs.property("javaVersion", javaVersion)
+	filesMatching("fabric.mod.json") {
+		// The add-on reaches into Velo Client's own classes, so it's pinned to the exact same build.
+		expand("version" to modVersion, "minecraft_dependency" to minecraftDependency,
+				"java_version" to javaVersion, "velo_client_version" to modVersion)
+	}
+}
+
+val addonJar = tasks.register<Jar>("addonJar") {
+	enabled = hasAddons
+	from(addon.output)
+	from(rootProject.file("LICENSE")) { rename { "${it}_velo-addons" } }
+	archiveBaseName.set("velo-addons")
+	// 1.21.11 still needs Loom's intermediary remap below; 26.1+ ships unobfuscated, so this
+	// plain jar is already the final one there.
+	if (sc.current.parsed < "26.1") {
+		archiveClassifier.set("dev")
+		destinationDirectory.set(layout.buildDirectory.dir("devlibs"))
+	}
+}
+
+if (sc.current.parsed < "26.1") {
+	val remapAddonJar = tasks.register<net.fabricmc.loom.task.RemapJarTask>("remapAddonJar") {
+		enabled = hasAddons
+		inputFile.set(addonJar.flatMap { it.archiveFile })
+		archiveBaseName.set("velo-addons")
+		addNestedDependencies.set(false)
+		classpath.from(sourceSets["main"].output, sourceSets["client"].output)
+	}
+	tasks.named("assemble") { dependsOn(remapAddonJar) }
+} else {
+	tasks.named("assemble") { dependsOn(addonJar) }
+}
+
+tasks.withType<JavaCompile>().configureEach {
+	options.release.set(requiredJava.majorVersion.toInt())
+	// Raised while porting to 26.x - javac's default 100-error cap was
+	// cutting off the real error list mid-file during the mechanical
+	// Yarn->Mojmap rename pass, hiding how many issues actually remained.
+	options.compilerArgs.add("-Xmaxerrs")
+	options.compilerArgs.add("2000")
+}
+
+java {
+	// Loom will automatically attach sourcesJar to a RemapSourcesJar task and to the "build" task
+	// if it is present.
+	// If you remove this line, sources will not be generated.
+	withSourcesJar()
+
+	sourceCompatibility = requiredJava
+	targetCompatibility = requiredJava
+}
+
+tasks.named<Jar>("jar") {
+	val archivesName = base.archivesName.get()
+	// Each version node's projectDir is versions/<version>/, not the repo
+	// root where LICENSE actually lives - a bare "LICENSE" here silently
+	// resolved to nothing and dropped the file from the jar.
+	val licenseFile = rootProject.file("LICENSE")
+	from(licenseFile) {
+		rename { "${it}_${archivesName}" }
+	}
+}

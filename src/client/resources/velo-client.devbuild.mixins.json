@@ -1,0 +1,33 @@
+{
+	"required": false,
+	"minVersion": "0.8",
+	"package": "net.veloclient.velo.devbuild.mixin",
+	"compatibilityLevel": "JAVA_21",
+	"client": [
+		"HiddenWindowMouseMixin",
+		"NumberedSlotMixin",
+		"RewindBackgroundMixin",
+		"RewindBlockEntityMixin",
+		"RewindCameraMixin",
+		"RewindChunkMixin",
+		"RewindClockMixin",
+		"RewindGlowMixin",
+		"RewindNameMixin",
+		"RewindNameStateMixin",
+		"RewindPacketMixin",
+		"RewindPreGuiMixin",
+		"RewindProtocolMixin",
+		"RewindRenderMixin",
+		"RewindSodiumChunkMixin",
+		"RewindSoundMixin",
+		"RewindTeamColorMixin",
+		"ShieldHolderMixin",
+		"ShieldSoundMixin",
+		"ShieldTintMixin",
+		"TurboGlOutlineSkipMixin",
+		"TurboGlVignetteMixin"
+	],
+	"injectors": {
+		"defaultRequire": 0
+	}
+}

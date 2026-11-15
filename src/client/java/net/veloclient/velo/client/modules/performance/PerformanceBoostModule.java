@@ -1,0 +1,946 @@
+package net.veloclient.velo.client.modules.performance;
+
+import net.minecraft.client.MinecraftClient;
+import net.minecraft.client.option.CloudRenderMode;
+import net.minecraft.client.option.GameOptions;
+import net.minecraft.client.option.GraphicsMode;
+//? if <1.21.2 {
+/*// (no inactivity FPS limit before 1.21.2)
+*///?} else {
+import net.minecraft.client.option.InactivityFpsLimit;
+//?}
+import net.minecraft.particle.ParticlesMode;
+import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientTickEvents;
+import net.veloclient.velo.module.AbstractModule;
+import net.veloclient.velo.module.ConfigField;
+import net.veloclient.velo.module.Configurable;
+import net.veloclient.velo.module.ModuleCategory;
+import net.veloclient.velo.module.SafetyTag;
+
+import java.util.List;
+
+/**
+ * Presets plus individually-tunable video settings for FPS, replacing the
+ * old single-preset "Performance Mode". The granular sliders/toggles below
+ * the preset picker are live views straight onto vanilla's own options -
+ * always editable, not gated behind this module's own enable switch - so
+ * picking "Max FPS" and then nudging just the view distance back up
+ * doesn't require re-toggling anything.
+ *
+ * <p>A few things worth being upfront about, since some of what's marketed
+ * for other clients as distinct named features aren't independently
+ * controllable through anything Minecraft actually exposes:
+ * <ul>
+ *   <li><b>Turbo Entities</b> maps to vanilla's own entity distance scaling -
+ *       a real, working lever.</li>
+ *   <li><b>Smart culling/occlusion</b> - vanilla already does frustum/chunk
+ *       visibility culling itself; there's no further public hook to extend
+ *       it (that's what dedicated rendering-engine mods like Sodium rewrite
+ *       from scratch), so this doesn't add a separate toggle that would just
+ *       do nothing.</li>
+ *   <li><b>Animate only visible textures</b> - no vanilla API exposes
+ *       per-texture visibility for animation; not implemented rather than
+ *       faked.</li>
+ *   <li><b>HUD Caching</b> is real and implemented here (see
+ *       {@link #hudCachingEnabled}) - it throttles this mod's own expensive
+ *       per-frame overlay work (e.g. counting every loaded entity) to about
+ *       20 times/second instead of every frame.</li>
+ *   <li><b>Dynamic FPS/unfocused capping</b> maps to vanilla's real
+ *       inactivity FPS limiter.</li>
+ *   <li><b>Memory allocation</b> is a JVM heap size (-Xmx), fixed at launch -
+ *       nothing running inside the game can change it live, so it belongs in
+ *       the launcher, not here.</li>
+ *   <li><b>"Poly Patcher"</b> is another client's own closed-source internal
+ *       system - not something that can be integrated.</li>
+ *   <li><b>Max FPS preset</b> additionally turns off the options that cost the most frame time
+ *       for the least visual difference: smooth lighting, cutout ("fancy") leaves - opaque leaves
+ *       are the single biggest win in forests - improved transparency, chunk fade-in, texture
+ *       filtering, menu blur, and a shorter weather radius.</li>
+ *   <li><b>Adaptive Render Distance</b> watches real FPS and steps the view distance down one
+ *       chunk at a time while it stays under the target (and back up to your own setting once
+ *       there's headroom), so a heavy area costs chunks instead of frame drops.</li>
+ * </ul>
+ */
+public final class PerformanceBoostModule extends AbstractModule implements Configurable,
+		net.veloclient.velo.client.gui.window.ModuleDashboard {
+
+	/**
+	 * Read by other modules to throttle expensive per-frame work (e.g. counting every loaded
+	 * entity) to ~20Hz instead of every frame. Defaults on: this module itself defaults to
+	 * enabled, and a throttle that only engages when someone happens to also flip the "HUD
+	 * Caching" toggle otherwise silently never fires for the common case, defeating the point of
+	 * shipping it in the first place.
+	 */
+	public static volatile boolean hudCachingEnabled = true;
+	/** See {@link DecoupledPresent}: render as fast as the GPU allows, show the newest frame the display can take. */
+	public static volatile boolean decoupledPresent = true;
+	/**
+	 * Turbo Block Entities: share of each block entity renderer's normal view distance (chests, signs, banners, heads,
+	 * shulkers...) that is still drawn; 1 = vanilla. Read by TurboBlockEntitiesMixin.
+	 */
+	public static volatile double turboBlockEntities = 1.0;
+
+	/**
+	 * Velo's own draw-path fixes for work vanilla repeats every frame: skipping GUI layers that
+	 * can't overlap a new element, and on Vulkan re-pushing only the descriptor bindings that
+	 * changed between draws and dropping redundant vertex/index buffer binds. Same pixels, less
+	 * render-thread time. Read by the GuiLayer* and VulkanDrawState mixins.
+	 */
+	public static volatile boolean fastDrawPath = true;
+	/** Velo Turbo master switch (for A/B runs: -Dvelo.renderProfileAB=turbo flips it); each part also has its own. */
+	public static volatile boolean turbo = !Boolean.getBoolean("velo.turboOff");
+	/** Velo Turbo: skip particles in chunk sections Sodium culled (behind walls, underground). */
+	public static volatile boolean turboParticleCull = true;
+	/** Velo Turbo: Velo's HUD modules redraw at most 360 times a second, frames in between reuse the draw list. */
+	public static volatile boolean hudFrameCache = true;
+	/**
+	 * Velo Turbo: incoming packets (chunk batches) spread over frames by a time budget. Off: two A/B rounds while moving
+	 * (2026-11-07) showed no change in average FPS or lows - single chunk packets are the slow part and can't be split.
+	 */
+	public static volatile boolean packetPacing = Boolean.getBoolean("velo.packetPacing");
+	/**
+	 * Light cosmetics, for weaker PCs: wings keep their wingbeat but drop their extra effects (moving arms, glow,
+	 * shine, particles), auras draw fewer particles.
+	 */
+	public static volatile boolean lightCosmetics = false;
+
+	private static final List<String> PRESETS = List.of("Auto", "Default", "Max FPS", "Medium Quality", "High Quality");
+	/** Quality steps Auto moves through, best first. */
+	private static final List<String> AUTO_LEVELS = List.of("High Quality", "Medium Quality", "Max FPS");
+	private static final int ADAPTIVE_MIN_DISTANCE = 5;
+	private static final int ADAPTIVE_WINDOW_TICKS = 60;
+
+	private GraphicsMode previousGraphics;
+	private ParticlesMode previousParticles;
+	private Boolean previousEntityShadows;
+	private Integer previousViewDistance;
+	private Boolean previousVsync;
+	private CloudRenderMode previousClouds;
+	private Integer previousBiomeBlend;
+	//? if <1.21.2 {
+	/*private Object previousInactivityLimit;
+	*///?} else {
+	private InactivityFpsLimit previousInactivityLimit;
+	//?}
+
+	// "Default" out of the box: it only turns VSync off and leaves the player's own video settings
+	// alone. "High Quality" as the default raised the view distance to 16 (and clouds, shadows,
+	// mipmaps...) on every launch, so a fresh install ran heavier than the settings the player chose.
+	private String preset = "Default";
+	/** Set while the saved profile is applied (fields first, then enable): onEnable must not re-apply the preset then. */
+	private long restoredFromProfileNanos;
+	private int autoTargetFps = 60;
+	private int autoLevel;
+	private boolean autoNotify = false;
+	private long autoFpsSum;
+	private int autoSamples;
+	private int autoLow;
+	private int autoHigh;
+	private long autoCooldownUntil;
+	private long autoTicks;
+	/** While Auto applies a step, view distance is left alone (changing it reloads every chunk). */
+	private boolean keepDistance;
+	private boolean dynamicFps = true;
+	private String vsyncMode = "Off";
+
+	private boolean adaptiveDistance = false;
+	private int targetFps = 90;
+	/** The view distance the player actually chose - adaptive mode never goes above it. */
+	private int adaptiveBaseline = -1;
+	private long fpsSum;
+	private int fpsSamples;
+	private int lowWindows;
+	private int highWindows;
+
+	public PerformanceBoostModule() {
+		super("performance-boost", "Performance Boost",
+				"Presets and individually tunable settings for maximum FPS.",
+				ModuleCategory.PERFORMANCE, SafetyTag.ALWAYS_SAFE, true);
+		ClientTickEvents.END_CLIENT_TICK.register(this::tickAdaptiveDistance);
+		ClientTickEvents.END_CLIENT_TICK.register(this::tickAuto);
+	}
+
+	/**
+	 * Averages real FPS over 3-second windows; two slow windows in a row drop the view distance
+	 * by one chunk, five fast ones in a row raise it back by one (never above the player's own
+	 * choice). Paused in menus and while unfocused, where FPS says nothing about the world.
+	 */
+	private void tickAdaptiveDistance(MinecraftClient client) {
+		//? if <26.1 {
+		boolean inMenu = client.currentScreen != null || !client.isWindowFocused();
+		//?} else if <26.2 {
+		/*boolean inMenu = client.screen != null || !client.isWindowActive();
+		*///?} else {
+		/*boolean inMenu = client.gui.screen() != null || !client.isWindowActive();
+		*///?}
+		if (!isEnabled() || !adaptiveDistance || client.world == null || client.player == null || inMenu) {
+			fpsSum = 0;
+			fpsSamples = 0;
+			return;
+		}
+		GameOptions options = client.options;
+		if (adaptiveBaseline < 0) {
+			adaptiveBaseline = options.getViewDistance().getValue();
+		}
+		fpsSum += VideoOptions.currentFps();
+		if (++fpsSamples < ADAPTIVE_WINDOW_TICKS) {
+			return;
+		}
+		double average = fpsSum / (double) fpsSamples;
+		fpsSum = 0;
+		fpsSamples = 0;
+		int distance = options.getViewDistance().getValue();
+		if (average < targetFps * 0.85) {
+			highWindows = 0;
+			if (++lowWindows >= 2 && distance > ADAPTIVE_MIN_DISTANCE) {
+				options.getViewDistance().setValue(distance - 1);
+				refreshRendering();
+				lowWindows = 0;
+			}
+		} else if (average > targetFps * 1.3) {
+			lowWindows = 0;
+			if (++highWindows >= 5 && distance < adaptiveBaseline) {
+				options.getViewDistance().setValue(distance + 1);
+				refreshRendering();
+				highWindows = 0;
+			}
+		} else {
+			lowWindows = 0;
+			highWindows = 0;
+		}
+	}
+
+	/**
+	 * Auto preset: averages FPS over 3-second windows while you're in a world. Three slow windows in
+	 * a row (below 90% of the target) step quality down one level; eight fast ones (above 160%)
+	 * step it back up. At least 20 seconds between steps so it never flickers between looks.
+	 */
+	// ---- In-game FPS: the dashboard shows what you get while playing, not the capped menu rate ----
+	private static final int[] PLAY_FPS = new int[600]; // last 30 s of play, one sample per tick
+	private static int playFpsCount;
+	private static int playFpsNext;
+
+	private static void samplePlayFps(MinecraftClient client) {
+		//? if <26.1 {
+		boolean playing = client.world != null && client.player != null && client.currentScreen == null && client.isWindowFocused();
+		//?} else if <26.2 {
+		/*boolean playing = client.level != null && client.player != null && client.screen == null && client.isWindowActive();
+		*///?} else {
+		/*boolean playing = client.level != null && client.player != null && client.gui.screen() == null && client.isWindowActive();
+		*///?}
+		if (!playing) {
+			return;
+		}
+		PLAY_FPS[playFpsNext] = VideoOptions.currentFps();
+		playFpsNext = (playFpsNext + 1) % PLAY_FPS.length;
+		playFpsCount = Math.min(PLAY_FPS.length, playFpsCount + 1);
+	}
+
+	/** Average FPS over the last 30 s of actual play (no menu open), or -1 before any. */
+	public static int averagePlayFps() {
+		if (playFpsCount == 0) {
+			return -1;
+		}
+		long sum = 0;
+		for (int i = 0; i < playFpsCount; i++) {
+			sum += PLAY_FPS[i];
+		}
+		return (int) (sum / playFpsCount);
+	}
+
+	private void tickAuto(MinecraftClient client) {
+		samplePlayFps(client);
+		autoTicks++;
+		//? if <26.1 {
+		boolean inMenu = client.currentScreen != null || !client.isWindowFocused();
+		//?} else if <26.2 {
+		/*boolean inMenu = client.screen != null || !client.isWindowActive();
+		*///?} else {
+		/*boolean inMenu = client.gui.screen() != null || !client.isWindowActive();
+		*///?}
+		if (!isEnabled() || !preset.equals("Auto") || client.world == null || client.player == null || inMenu) {
+			autoFpsSum = 0;
+			autoSamples = 0;
+			return;
+		}
+		autoFpsSum += VideoOptions.currentFps();
+		if (++autoSamples < ADAPTIVE_WINDOW_TICKS) {
+			return;
+		}
+		double average = autoFpsSum / (double) autoSamples;
+		autoFpsSum = 0;
+		autoSamples = 0;
+		if (autoTicks < autoCooldownUntil) {
+			return;
+		}
+		int next = autoLevel;
+		if (average < autoTargetFps * 0.9) {
+			autoHigh = 0;
+			if (++autoLow >= 3 && autoLevel < AUTO_LEVELS.size() - 1) {
+				next = autoLevel + 1;
+			}
+		} else if (average > autoTargetFps * 1.6) {
+			autoLow = 0;
+			if (++autoHigh >= 8 && autoLevel > 0) {
+				next = autoLevel - 1;
+			}
+		} else {
+			autoLow = 0;
+			autoHigh = 0;
+		}
+		if (next != autoLevel) {
+			autoLevel = next;
+			autoLow = 0;
+			autoHigh = 0;
+			autoCooldownUntil = autoTicks + 400;
+			// While playing, Auto only steps the settings that don't rebuild terrain (particles, shadows, clouds, entity
+			// distance, weather). Graphics mode, smooth lighting, leaves, biome blend and mipmaps each rebuilt every loaded
+			// chunk (mipmaps even reloaded the texture atlas) - the "chunks reload by themselves" players saw every 20 s.
+			autoCheapOnly = true;
+			try {
+				applyPreset("Auto");
+			} finally {
+				autoCheapOnly = false;
+			}
+			if (autoNotify) {
+				net.veloclient.velo.client.social.NotificationOverlay.show(new net.veloclient.velo.client.social.NotificationOverlay.Toast(
+						null, null, "Auto graphics: " + AUTO_LEVELS.get(autoLevel), String.format(java.util.Locale.ROOT,
+								"Averaging %.0f FPS (target %d).", average, autoTargetFps), 3500, null, null, null));
+			}
+		}
+	}
+
+	/** Puts the view distance back to what the player chose, when adaptive mode stops. */
+	private void restoreAdaptiveBaseline() {
+		if (adaptiveBaseline > 0) {
+			GameOptions options = MinecraftClient.getInstance().options;
+			if (options.getViewDistance().getValue() != adaptiveBaseline) {
+				options.getViewDistance().setValue(adaptiveBaseline);
+				refreshRendering();
+			}
+		}
+		adaptiveBaseline = -1;
+		lowWindows = 0;
+		highWindows = 0;
+	}
+
+	@Override
+	public void onEnable() {
+		GameOptions options = MinecraftClient.getInstance().options;
+		previousGraphics = options.getPreset().getValue();
+		previousParticles = options.getParticles().getValue();
+		previousEntityShadows = options.getEntityShadows().getValue();
+		previousViewDistance = options.getViewDistance().getValue();
+		previousVsync = options.getEnableVsync().getValue();
+		previousClouds = options.getCloudRenderMode().getValue();
+		previousBiomeBlend = options.getBiomeBlendRadius().getValue();
+		//? if <1.21.2 {
+		/*previousInactivityLimit = null;
+		*///?} else {
+		previousInactivityLimit = options.getInactivityFpsLimit().getValue();
+		//?}
+
+		if (restoredFromProfileNanos != 0 && System.nanoTime() - restoredFromProfileNanos < 3_000_000_000L) {
+			// Started with the saved profile: its fields already hold exactly what the player set - re-applying the
+			// preset here overwrote every tweak made after picking it (view distance, clouds, VSync...) on each start.
+			restoredFromProfileNanos = 0;
+		} else {
+			applyPresetAndRefresh(preset);
+		}
+		// (Not while profiling: the profiled window has no focus or input, and AFK capping would hold it at 30 FPS.)
+		if (dynamicFps && !net.veloclient.velo.client.devtools.RenderProfiler.ENABLED && !Boolean.getBoolean("velo.benchNoAfk")) {
+			//? if <1.21.2 {
+			/*// 1.21.1 keeps its own background FPS
+			*///?} else {
+			options.getInactivityFpsLimit().setValue(InactivityFpsLimit.AFK);
+			//?}
+		} else if (!dynamicFps) {
+			// Off means off: vanilla's own default is AFK (30 FPS after a minute without input, 10 after ten), so leaving the
+			// option alone kept the limit on even with Dynamic FPS turned off.
+			//? if >=1.21.2 {
+			options.getInactivityFpsLimit().setValue(InactivityFpsLimit.MINIMIZED);
+			//?}
+		}
+		// applyPreset() above writes straight to the GameOptions values, same as every
+		// individual slider/toggle below already does - but unlike those, this path never called
+		// refreshRendering() afterward. Vanilla's own video settings screen only actually re-queues
+		// terrain (picking up view distance/entity distance/shadows/clouds/biome blend) through a
+		// UI change-callback that a direct setValue() call bypasses entirely, so toggling this
+		// module off and back on mid-session silently changed the options with no visible FPS
+		// difference until something else happened to trigger a refresh - exactly the "doesn't
+		// seem to do anything" symptom this was reported as.
+		refreshRendering();
+	}
+
+	@Override
+	public void onDisable() {
+		if (previousGraphics == null) {
+			return;
+		}
+		restoreAdaptiveBaseline();
+		GameOptions options = MinecraftClient.getInstance().options;
+		options.getPreset().setValue(previousGraphics);
+		options.getParticles().setValue(previousParticles);
+		options.getEntityShadows().setValue(previousEntityShadows);
+		options.getViewDistance().setValue(previousViewDistance);
+		options.getEnableVsync().setValue(previousVsync);
+		options.getCloudRenderMode().setValue(previousClouds);
+		options.getBiomeBlendRadius().setValue(previousBiomeBlend);
+		//? if <1.21.2 {
+		/*//
+		*///?} else {
+		options.getInactivityFpsLimit().setValue(previousInactivityLimit);
+		//?}
+		previousGraphics = null;
+		// Same reasoning as onEnable() above - restoring the previous values directly needs the
+		// same explicit refresh to actually take visible effect again.
+		refreshRendering();
+	}
+
+	/** Auto's in-game steps: only settings that don't rebuild chunks (see tickAuto). */
+	private boolean autoCheapOnly;
+
+	/** Every option that changes block meshes or the block atlas: when one of them changes, the loaded chunks are rebuilt. */
+	private static String meshKey() {
+		GameOptions options = MinecraftClient.getInstance().options;
+		return options.getPreset().getValue() + "|" + options.getBiomeBlendRadius().getValue() + "|" + options.getMipmapLevels().getValue() + "|"
+				+ VideoOptions.smoothLighting() + "|" + VideoOptions.fancyLeaves() + "|" + VideoOptions.improvedTransparency();
+	}
+
+	/** {@link #applyPreset} plus a chunk rebuild only when a mesh setting actually changed. */
+	private void applyPresetAndRefresh(String name) {
+		String before = meshKey();
+		applyPreset(name);
+		if (!before.equals(meshKey())) {
+			reloadRendering();
+		} else {
+			refreshRendering();
+		}
+	}
+
+	private void applyPreset(String name) {
+		GameOptions options = MinecraftClient.getInstance().options;
+		if (autoCheapOnly && !name.equals("Auto")) {
+			options.getParticles().setValue(name.equals("High Quality") ? ParticlesMode.ALL : name.equals("Medium Quality") ? ParticlesMode.DECREASED
+					: ParticlesMode.MINIMAL);
+			options.getEntityShadows().setValue(name.equals("High Quality"));
+			options.getCloudRenderMode().setValue(name.equals("High Quality") ? CloudRenderMode.FANCY : name.equals("Medium Quality")
+					? CloudRenderMode.FAST : CloudRenderMode.OFF);
+			options.getEntityDistanceScaling().setValue(name.equals("High Quality") ? 1.5 : name.equals("Medium Quality") ? 1.0 : 0.5);
+			if (name.equals("Max FPS")) {
+				VideoOptions.setWeatherRadius(3);
+			}
+			return;
+		}
+		if (name.equals("Auto")) {
+			keepDistance = true;
+			try {
+				applyPreset(AUTO_LEVELS.get(Math.max(0, Math.min(AUTO_LEVELS.size() - 1, autoLevel))));
+			} finally {
+				keepDistance = false;
+			}
+			return;
+		}
+		switch (name) {
+			// One fast preset (it used to be two, "Performance" and "Max FPS", that differed only by 2 chunks of view
+			// distance - confusing). Distance capped at 8: below that PvP players lose sight of others.
+			case "Max FPS", "Performance" -> {
+				options.getPreset().setValue(GraphicsMode.FAST);
+				options.getParticles().setValue(ParticlesMode.MINIMAL);
+				options.getEntityShadows().setValue(false);
+				if (!keepDistance) {
+					options.getViewDistance().setValue(Math.min(options.getViewDistance().getValue(), 8));
+				}
+				if (!keepDistance) {
+					options.getSimulationDistance().setValue(Math.min(options.getSimulationDistance().getValue(), 8));
+				}
+				applyVsyncMode("Off");
+				options.getCloudRenderMode().setValue(CloudRenderMode.OFF);
+				options.getBiomeBlendRadius().setValue(0);
+				options.getEntityDistanceScaling().setValue(0.5);
+				options.getMipmapLevels().setValue(0);
+				applyLowCostRendering();
+				VideoOptions.setWeatherRadius(3);
+			}
+			case "Medium Quality" -> {
+				options.getPreset().setValue(GraphicsMode.FAST);
+				options.getParticles().setValue(ParticlesMode.DECREASED);
+				options.getEntityShadows().setValue(false);
+				if (!keepDistance) {
+					options.getViewDistance().setValue(Math.max(options.getViewDistance().getValue(), heapSafeDistance(12)));
+				}
+				applyVsyncMode("Off");
+				options.getCloudRenderMode().setValue(CloudRenderMode.FAST);
+				options.getBiomeBlendRadius().setValue(2);
+				options.getEntityDistanceScaling().setValue(1.0);
+				options.getMipmapLevels().setValue(2);
+				VideoOptions.setSmoothLighting(true);
+				VideoOptions.setFancyLeaves(false);
+				VideoOptions.setImprovedTransparency(false);
+			}
+			case "High Quality" -> {
+				options.getPreset().setValue(GraphicsMode.FANCY);
+				options.getParticles().setValue(ParticlesMode.ALL);
+				options.getEntityShadows().setValue(true);
+				if (!keepDistance) {
+					options.getViewDistance().setValue(Math.max(options.getViewDistance().getValue(), heapSafeDistance(16)));
+				}
+				applyVsyncMode("Off");
+				options.getCloudRenderMode().setValue(CloudRenderMode.FANCY);
+				options.getBiomeBlendRadius().setValue(5);
+				options.getEntityDistanceScaling().setValue(1.5);
+				options.getMipmapLevels().setValue(4);
+				VideoOptions.setSmoothLighting(true);
+				VideoOptions.setFancyLeaves(true);
+			}
+			default -> {
+				// "Default" - since this module is enabled out of the box,
+				// this preset must not touch graphics mode, particles,
+				// shadows, clouds, biome blend, entity distance or mipmaps
+				// at all: forcing those to Fancy/All/On unconditionally on
+				// every fresh install, regardless of what the player already
+				// had configured for their own hardware, was a real bug -
+				// it made performance dramatically WORSE than plain vanilla
+				// for anyone who had already turned those down. VSync off is
+				// the only thing this preset applies, since it's a pure
+				// performance lever with no visual-quality tradeoff of its
+				// own that every preset (including this one) should have.
+				applyVsyncMode("Off");
+			}
+		}
+	}
+
+	/**
+	 * The options with the worst cost-to-looks ratio: smooth lighting, cutout ("fancy") leaves -
+	 * opaque leaves stop every leaf block's faces being drawn and blended, the biggest single win
+	 * in forests - improved transparency, chunk fade-in, texture filtering and menu blur.
+	 */
+	private static void applyLowCostRendering() {
+		VideoOptions.setSmoothLighting(false);
+		VideoOptions.setFancyLeaves(false);
+		VideoOptions.setImprovedTransparency(false);
+		VideoOptions.setChunkFade(0.0);
+		VideoOptions.setTextureFilteringOff();
+		VideoOptions.setMenuBlur(0);
+		VideoOptions.setCloudRange(2);
+	}
+
+	@Override
+	public List<ConfigField> configFields() {
+		GameOptions options = MinecraftClient.getInstance().options;
+		List<ConfigField> fields = new java.util.ArrayList<>(List.of(
+				new ConfigField.HeaderField("Preset"),
+				new ConfigField.ChoiceField("Preset", PRESETS, () -> preset, v -> {
+					// saved before the merge: "Performance" is Max FPS now
+					preset = v.equals("Performance") ? "Max FPS" : v;
+					if (v.equals("Auto")) {
+						autoLevel = 0;
+					}
+					if (isEnabled()) {
+						applyPresetAndRefresh(preset);
+					}
+				}),
+				new ConfigField.SliderField("Auto: Target FPS", 30, 240, () -> autoTargetFps, v -> autoTargetFps = (int) Math.round(v / 5) * 5,
+						v -> (int) Math.round(v / 5) * 5 + " FPS"),
+				new ConfigField.ToggleField("Auto: Notify On Quality Change", () -> autoNotify, v -> autoNotify = v),
+				new ConfigField.HeaderField("Frame Rate"),
+				new ConfigField.SliderField("Max FPS", 10, 260,
+						() -> options.getMaxFps().getValue(), v -> options.getMaxFps().setValue((int) v),
+						v -> (int) v >= 260 ? "Unlimited" : String.valueOf((int) v)),
+				new ConfigField.ChoiceField("VSync Mode", List.of("Off", "On", "Adaptive"), () -> vsyncMode, this::applyVsyncMode),
+				new ConfigField.ToggleField("Uncapped Rendering (decoupled present, Vulkan)", () -> decoupledPresent, v -> decoupledPresent = v),
+				new ConfigField.ToggleField("Dynamic FPS (throttle when unfocused/AFK)", () -> dynamicFps, v -> {
+					dynamicFps = v;
+					if (isEnabled() && !net.veloclient.velo.client.devtools.RenderProfiler.ENABLED && !Boolean.getBoolean("velo.benchNoAfk")) {
+						//? if <1.21.2 {
+						/*//
+						*///?} else {
+						options.getInactivityFpsLimit().setValue(v ? InactivityFpsLimit.AFK : InactivityFpsLimit.MINIMIZED);
+						//?}
+					}
+				}),
+				new ConfigField.HeaderField("View Distance"),
+				new ConfigField.SliderField("View Distance", 2, 32,
+						// while Adaptive Render Distance has lowered it, the profile keeps the player's own value
+						() -> adaptiveBaseline > 0 ? adaptiveBaseline : options.getViewDistance().getValue(), v -> {
+							options.getViewDistance().setValue((int) v);
+							// A manual change is the new ceiling adaptive mode works under.
+							if (adaptiveBaseline > 0) {
+								adaptiveBaseline = (int) v;
+							}
+							refreshRendering();
+						}, v -> String.valueOf((int) v)),
+				new ConfigField.SliderField("Simulation Distance", 5, 32,
+						() -> options.getSimulationDistance().getValue(), v -> options.getSimulationDistance().setValue((int) v), v -> String.valueOf((int) v)),
+				new ConfigField.ToggleField("Adaptive Render Distance", () -> adaptiveDistance, v -> {
+					adaptiveDistance = v;
+					if (!v) {
+						restoreAdaptiveBaseline();
+					}
+				}),
+				new ConfigField.SliderField("Adaptive Target FPS", 30, 240, () -> targetFps, v -> targetFps = (int) v,
+						v -> (int) v + " FPS"),
+				new ConfigField.SliderField("Turbo Entities (entity distance)", 0.5, 5.0,
+						() -> options.getEntityDistanceScaling().getValue(),
+						v -> { options.getEntityDistanceScaling().setValue(v); refreshRendering(); },
+						v -> Math.round(v * 100) + "%"),
+				new ConfigField.SliderField("Turbo Block Entities (chest, sign & banner distance)", 0.25, 1.0,
+						() -> turboBlockEntities, v -> turboBlockEntities = Math.round(v * 20) / 20.0,
+						v -> v >= 0.999 ? "Vanilla" : Math.round(v * 100) + "%"),
+				new ConfigField.HeaderField("Visuals"),
+				new ConfigField.ChoiceField("Particles", List.of("Minimal", "Decreased", "All"),
+						() -> particlesLabel(options.getParticles().getValue()),
+						v -> { options.getParticles().setValue(particlesFromLabel(v)); refreshRendering(); }),
+				new ConfigField.ToggleField("Entity Shadows", () -> options.getEntityShadows().getValue(),
+						v -> { options.getEntityShadows().setValue(v); refreshRendering(); }),
+				new ConfigField.ToggleField("Clouds", () -> options.getCloudRenderMode().getValue() != CloudRenderMode.OFF,
+						v -> { options.getCloudRenderMode().setValue(v ? CloudRenderMode.FAST : CloudRenderMode.OFF); refreshRendering(); }),
+				new ConfigField.ToggleField("Smooth Lighting", VideoOptions::smoothLighting,
+						v -> { VideoOptions.setSmoothLighting(v); reloadRendering(); }),
+				new ConfigField.ToggleField("Fancy Leaves", VideoOptions::fancyLeaves,
+						v -> { VideoOptions.setFancyLeaves(v); reloadRendering(); }),
+				new ConfigField.ToggleField("Improved Transparency", VideoOptions::improvedTransparency,
+						v -> { VideoOptions.setImprovedTransparency(v); reloadRendering(); }),
+				new ConfigField.SliderField("Biome Blend", 0, 7,
+						() -> options.getBiomeBlendRadius().getValue(),
+						v -> { options.getBiomeBlendRadius().setValue((int) v); reloadRendering(); }, v -> String.valueOf((int) v)),
+				new ConfigField.SliderField("Mipmap Levels", 0, 4,
+						() -> options.getMipmapLevels().getValue(),
+						v -> { options.getMipmapLevels().setValue((int) v); reloadRendering(); }, v -> String.valueOf((int) v)),
+				new ConfigField.ToggleField("Chunk Fade-In", () -> VideoOptions.chunkFade() > 0,
+						v -> VideoOptions.setChunkFade(v ? 0.75 : 0.0)),
+				new ConfigField.HeaderField("Velo Engine"),
+				new ConfigField.ToggleField("Fast Draw Path (GUI layering + Vulkan draw state)", () -> fastDrawPath, v -> fastDrawPath = v),
+				new ConfigField.ToggleField("HUD Caching (~20Hz overlay updates)", () -> hudCachingEnabled, v -> hudCachingEnabled = v)
+));
+		if (VideoOptions.hasGraphicsBackendChoice()) {
+			fields.add(new ConfigField.ChoiceField("Graphics API (restart)", List.of("Default", "OpenGL", "Vulkan"),
+					VideoOptions::graphicsBackend, VideoOptions::setGraphicsBackend));
+		}
+		// Cosmetics: their own module (detail per player, GPU path) - one click from here.
+		fields.add(new ConfigField.HeaderField("Cosmetics"));
+		fields.add(new ConfigField.ActionButtonField("Cosmetics Quality...", () -> net.veloclient.velo.module.ModuleRegistry.get("cosmetics-quality")
+				.ifPresent(module -> {
+					var client = MinecraftClient.getInstance();
+					//? if <26.1 {
+					var back = client.currentScreen;
+					//?} else if <26.2 {
+					/*var back = client.screen;
+					*///?} else {
+					/*var back = client.gui.screen();
+					*///?}
+					client.setScreen(new net.veloclient.velo.client.gui.window.ModuleConfigScreen(module, () -> client.setScreen(back)));
+				})));
+		return fields;
+	}
+
+	// ---- Dashboard (the big settings window, see ModuleDashboard) ----
+
+	private boolean gpuTimingBefore;
+
+	@Override
+	public void dashboardOpened() {
+		// vanilla only measures GPU time while something shows it
+		gpuTimingBefore = GpuUtilizationModule.showing;
+		GpuUtilizationModule.showing = true;
+	}
+
+	@Override
+	public void dashboardClosed() {
+		GpuUtilizationModule.showing = gpuTimingBefore;
+	}
+
+	@Override
+	public List<Stat> dashboardStats() {
+		MinecraftClient client = MinecraftClient.getInstance();
+		GameOptions options = client.options;
+		// In-game average (menus are capped, so the live number here said nothing about play).
+		int avg = averagePlayFps();
+		int fps = avg >= 0 ? avg : net.veloclient.velo.client.gui.title.MenuInfo.fps();
+		int target = preset.equals("Auto") ? autoTargetFps : adaptiveDistance ? targetFps : 60;
+		int fpsColor = fps >= target ? 0xFF4ADE80 : fps >= target * 0.6 ? 0xFFF5B942 : 0xFFF87171;
+		int cap = options.getMaxFps().getValue();
+		String frame = fps > 0 ? String.format(java.util.Locale.ROOT, "%.1f ms", 1000.0 / fps) : "-";
+		double gpu = client.getGpuUtilizationPercentage();
+		String gpuText = gpu > 0 ? Math.round(Math.min(100, gpu)) + "%" : "...";
+		int gpuColor = gpu > 100 ? 0xFFF87171 : 0xFFF4F4F6;
+		String describe = net.veloclient.velo.client.util.GpuInfo.describe();
+		String api = describe == null ? "" : describe.contains("Vulkan") ? "Vulkan" : "OpenGL";
+		String presetValue = !isEnabled() ? "Off" : preset.replace(" Quality", "");
+		return List.of(
+				new Stat("In-game FPS", avg >= 0 ? String.valueOf(fps) : "-", avg >= 0 ? "avg 30 s" : "play a bit", fpsColor, -1f, true),
+				new Stat("Frame", frame, "", 0xFFF4F4F6),
+				new Stat("GPU", gpuText, api, gpuColor, (float) Math.min(1, gpu / 100), false),
+				new Stat("View", String.valueOf(options.getViewDistance().getValue()), adaptiveDistance ? "adaptive" : "chunks", 0xFFF4F4F6,
+						options.getViewDistance().getValue() / 32f, false),
+				new Stat("Preset", presetValue, preset.endsWith(" Quality") && isEnabled() ? "quality" : "", isEnabled() ? 0xFFF4F4F6 : 0xFF9A9AA6));
+	}
+
+	@Override
+	public String cardChoice() {
+		return "Preset";
+	}
+
+	@Override
+	public String cardBlurb(String option) {
+		return switch (option) {
+			case "Auto" -> "Holds target FPS";
+			case "Default" -> "Your own settings";
+			case "Max FPS" -> "Fastest";
+			case "Medium Quality" -> "Balanced";
+			case "High Quality" -> "Best visuals";
+			default -> "";
+		};
+	}
+
+	@Override
+	public int[] cardMeters(String option) {
+		return switch (option) {
+			case "Auto" -> new int[] {4, 4};
+			case "Default" -> new int[] {3, 3};
+			case "Max FPS" -> new int[] {5, 1};
+			case "Medium Quality" -> new int[] {4, 3};
+			case "High Quality" -> new int[] {2, 5};
+			default -> null;
+		};
+	}
+
+	@Override
+	public String sectionSummary(String section) {
+		GameOptions options = MinecraftClient.getInstance().options;
+		return switch (section) {
+			case "Preset" -> !isEnabled() ? "Off" : preset.equals("Auto") ? "Auto · " + autoLevelName() : preset;
+			case "Frame Rate" -> {
+				int cap = options.getMaxFps().getValue();
+				yield (cap >= 260 ? "Unlimited" : cap + " FPS") + " · VSync " + vsyncMode;
+			}
+			case "View Distance" -> options.getViewDistance().getValue() + " chunks" + (adaptiveDistance ? " · adaptive" : "");
+			case "Visuals" -> "Particles " + particlesLabel(options.getParticles().getValue());
+			case "Velo Engine" -> ((fastDrawPath ? 1 : 0) + (hudCachingEnabled ? 1 : 0)) + " of 2 on";
+			case "Cosmetics" -> {
+				var module = net.veloclient.velo.module.ModuleRegistry.get("cosmetics-quality").orElse(null);
+				if (module == null || !module.isEnabled()) {
+					yield "Full detail";
+				}
+				String mode = "";
+				if (module instanceof Configurable configurable) {
+					for (ConfigField field : configurable.configFields()) {
+						if (field instanceof ConfigField.ChoiceField choice) {
+							mode = choice.get().get();
+							break;
+						}
+					}
+				}
+				yield mode + (net.veloclient.velo.client.cosmetics.render.GpuCosmetics.enabled ? " · GPU" : "");
+			}
+			default -> null;
+		};
+	}
+
+	@Override
+	public String dashboardTip() {
+		if (!isEnabled()) {
+			return "Performance Boost is off - the switch at the top right turns it on.";
+		}
+		GameOptions options = MinecraftClient.getInstance().options;
+		// In-game average (menus are capped, so the live number here said nothing about play).
+		int avg = averagePlayFps();
+		int fps = avg >= 0 ? avg : net.veloclient.velo.client.gui.title.MenuInfo.fps();
+		int target = preset.equals("Auto") ? autoTargetFps : adaptiveDistance ? targetFps : 60;
+		int distance = options.getViewDistance().getValue();
+		if (fps > 0 && fps < target) {
+			if (distance > 12 && !adaptiveDistance) {
+				return "Below " + target + " FPS: View Distance (" + distance + ") is the biggest gain - try 12, or Adaptive.";
+			}
+			if (!preset.equals("Auto") && !preset.equals("Max FPS")) {
+				return "Below " + target + " FPS: the Auto preset lowers quality only while your FPS drops.";
+			}
+			return "Still slow? Particles Minimal and Clouds off help on weaker GPUs.";
+		}
+		if (vsyncMode.equals("On")) {
+			return "VSync caps FPS at your monitor's refresh rate - Adaptive avoids the stutter below it.";
+		}
+		return null;
+	}
+
+	private String autoLevelName() {
+		return AUTO_LEVELS.get(Math.max(0, Math.min(AUTO_LEVELS.size() - 1, autoLevel))).replace(" Quality", "");
+	}
+
+	@Override
+	public String cardStatus(String option) {
+		if (!option.equals("Auto") || !isEnabled()) {
+			return null;
+		}
+		String level = AUTO_LEVELS.get(Math.max(0, Math.min(AUTO_LEVELS.size() - 1, autoLevel)));
+		return "Now: " + level.replace(" Quality", "");
+	}
+
+	@Override
+	public String sectionHint(String section) {
+		return switch (section) {
+			case "Preset" -> "Pick a starting point - every setting stays adjustable in the other sections.";
+			case "Frame Rate" -> "How many frames are drawn, and when to save power.";
+			case "View Distance" -> "How far the world and entities load - the biggest FPS lever.";
+			case "Visuals" -> "Vanilla video settings that cost frames.";
+			case "Velo Engine" -> "Velo's own rendering speed-ups. Leave them on unless something looks wrong.";
+			case "Cosmetics" -> "Cloaks, wings and auras: full detail near you, lighter further away and in crowds.";
+			default -> null;
+		};
+	}
+
+	@Override
+	public List<ConfigField> sectionOverride(String section) {
+		if (section.equals("Preset")) {
+			// The cards, Auto's own settings while Auto runs, and the three settings people change most.
+			java.util.Map<String, ConfigField> byLabel = new java.util.HashMap<>();
+			for (ConfigField field : configFields()) {
+				if (!(field instanceof ConfigField.HeaderField)) { // "Preset" / "View Distance" are section titles too
+					byLabel.putIfAbsent(field.label(), field);
+				}
+			}
+			List<ConfigField> fields = new java.util.ArrayList<>();
+			fields.add(byLabel.get("Preset"));
+			if (preset.equals("Auto")) {
+				fields.add(byLabel.get("Auto: Target FPS"));
+				fields.add(byLabel.get("Auto: Notify On Quality Change"));
+			}
+			fields.add(new ConfigField.HeaderField("Quick Settings"));
+			fields.add(byLabel.get("Max FPS"));
+			fields.add(byLabel.get("View Distance"));
+			fields.add(byLabel.get("VSync Mode"));
+			fields.add(byLabel.get("Dynamic FPS (throttle when unfocused/AFK)"));
+			fields.removeIf(java.util.Objects::isNull);
+			return fields;
+		}
+		if (section.equals("Cosmetics")) {
+			// Cosmetics Quality's own settings, right here (still saved by that module)
+			var module = net.veloclient.velo.module.ModuleRegistry.get("cosmetics-quality").orElse(null);
+			if (module instanceof Configurable configurable) {
+				List<ConfigField> fields = new java.util.ArrayList<>();
+				fields.add(new ConfigField.ToggleField("Cosmetics Quality", module::isEnabled, module::setEnabled));
+				fields.addAll(configurable.configFields());
+				return fields;
+			}
+		}
+		return null;
+	}
+
+	/** Profile hook: marks that the fields were just restored, so the following enable keeps them. Always saved. */
+	@Override
+	public String extraState() {
+		return "1";
+	}
+
+	@Override
+	public void restoreExtraState(String state) {
+		restoredFromProfileNanos = System.nanoTime(); // only the enable right after this restore keeps the fields
+	}
+
+	/** The Graphics API belongs to options.txt (the launcher sets it there) - a profile copy would overwrite the launcher's choice. */
+	@Override
+	public boolean persistField(String label) {
+		return !label.startsWith("Graphics API");
+	}
+
+	/**
+	 * Vanilla's own video settings screen doesn't just write the new value -
+	 * it also pokes the world renderer to actually pick the change up, which
+	 * these sliders weren't doing, so a dragged value only visibly took
+	 * effect once something else (like re-enabling this module) happened to
+	 * trigger a refresh incidentally.
+	 */
+	private static void refreshRendering() {
+		MinecraftClient client = MinecraftClient.getInstance();
+		//? if <26.1 {
+		if (client.worldRenderer != null) {
+			client.worldRenderer.scheduleTerrainUpdate();
+		}
+		//?} else if <26.2 {
+		/*if (client.levelRenderer != null) {
+			client.levelRenderer.needsUpdate();
+		}
+		*///?} else {
+		/*// 26.2: allChanged() is the FULL rebuild of every loaded chunk (the old lightweight terrain re-queue is gone). Nothing
+		// that comes here needs one: a new view distance is picked up by the renderer itself (it compares the distance each
+		// frame); particles, shadows, clouds and entity distance don't touch chunk meshes. Mesh settings use reloadRendering().
+		*///?}
+	}
+
+	/** Mipmap levels change the texture atlas itself, not just how it's rendered - that needs the heavier full reload, not just a terrain re-queue. */
+	/** Rebuilds every loaded chunk (render settings that change block meshes). */
+	public static void reloadRendering() {
+		MinecraftClient client = MinecraftClient.getInstance();
+		//? if <26.1 {
+		if (client.worldRenderer != null) {
+			client.worldRenderer.reload();
+		}
+		//?} else if <26.2 {
+		/*if (client.levelRenderer != null) {
+			client.levelRenderer.allChanged();
+		}
+		*///?} else {
+		/*if (client.levelExtractor != null) {
+			client.levelExtractor.allChanged();
+		}
+		*///?}
+	}
+
+	/**
+	 * Full VSync (swap interval 1) hard-caps FPS to the display's refresh
+	 * rate, which is the "too harsh" tradeoff for tearing that pushes people
+	 * to just leave it off. Adaptive VSync (interval -1) still syncs when a
+	 * frame is ready in time - avoiding tearing the same way - but stops
+	 * syncing instead of stalling when a frame runs late, so it doesn't
+	 * impose the same hard ceiling. Vanilla's own VSync option is a plain
+	 * on/off that only ever calls {@code glfwSwapInterval} with 0 or 1, so
+	 * reaching -1 means calling it directly instead of going through that
+	 * option. If the platform/driver doesn't actually support adaptive sync,
+	 * GLFW itself falls back to regular VSync rather than erroring.
+	 */
+	private void applyVsyncMode(String mode) {
+		vsyncMode = mode;
+		GameOptions options = MinecraftClient.getInstance().options;
+		switch (mode) {
+			case "On" -> {
+				net.veloclient.velo.client.util.Keys.setSwapInterval(1);
+				options.getEnableVsync().setValue(true);
+			}
+			case "Adaptive" -> {
+				net.veloclient.velo.client.util.Keys.setSwapInterval(-1);
+				options.getEnableVsync().setValue(true);
+			}
+			default -> {
+				net.veloclient.velo.client.util.Keys.setSwapInterval(0);
+				options.getEnableVsync().setValue(false);
+			}
+		}
+	}
+
+	/**
+	 * The quality presets raise view distance, but chunk data grows with its square: forcing 16 on
+	 * a 2-3 GB heap was enough to run the game out of memory. Limit what a preset raises it to by
+	 * the heap the launcher gave this session (the player can still pick more by hand).
+	 */
+	private static int heapSafeDistance(int wanted) {
+		long heapMb = Runtime.getRuntime().maxMemory() / (1024 * 1024);
+		int cap = heapMb < 3000 ? 10 : heapMb < 4500 ? 12 : heapMb < 6000 ? 16 : 32;
+		return Math.min(wanted, cap);
+	}
+
+	private static String particlesLabel(ParticlesMode mode) {
+		return switch (mode) {
+			case MINIMAL -> "Minimal";
+			case DECREASED -> "Decreased";
+			case ALL -> "All";
+		};
+	}
+
+	private static ParticlesMode particlesFromLabel(String label) {
+		return switch (label) {
+			case "Minimal" -> ParticlesMode.MINIMAL;
+			case "Decreased" -> ParticlesMode.DECREASED;
+			default -> ParticlesMode.ALL;
+		};
+	}
+}

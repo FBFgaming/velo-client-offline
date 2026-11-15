@@ -1,0 +1,746 @@
+package net.veloclient.velo.client.worldmap;
+
+import net.minecraft.client.MinecraftClient;
+import net.minecraft.client.gl.RenderPipelines;
+import net.minecraft.client.gui.Click;
+import net.minecraft.client.gui.DrawContext;
+import net.minecraft.client.gui.screen.Screen;
+import net.minecraft.text.Text;
+import net.minecraft.util.Identifier;
+import net.veloclient.velo.client.gui.WaypointEditScreen;
+import net.veloclient.velo.client.gui.widget.VeloDraw;
+import net.veloclient.velo.client.gui.widget.VeloStyle;
+import net.veloclient.velo.client.gui.widget.VeloUi;
+import net.veloclient.velo.client.gui.window.VeloWindow;
+import net.veloclient.velo.client.waypoints.Waypoint;
+import net.veloclient.velo.client.waypoints.WaypointManager;
+import net.veloclient.velo.client.waypoints.WaypointTeleport;
+
+import java.nio.file.Files;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Locale;
+
+/**
+ * The world map: everywhere you've explored in this world, full screen. Drag to move, scroll to zoom
+ * (smoothly, toward the cursor), right-click for "add waypoint here" / "copy coordinates". Layers:
+ * Surface (map colors with relief shading), Topography (height colors + contour lines), Biomes and
+ * Caves (recorded at your height while underground - pick the level). Shows you, your waypoints and
+ * death points; switch dimensions to look at the Nether/End maps you've explored.
+ */
+public final class WorldMapScreen extends VeloWindow {
+
+	private enum Layer { SURFACE("Surface"), TOPOGRAPHY("Topography"), BIOMES("Biomes"), CAVES("Caves");
+		final String label;
+		Layer(String label) {
+			this.label = label;
+		}
+	}
+
+	// View state survives closing and reopening the map.
+	private static Layer layer = Layer.SURFACE;
+	private static double centerX = Double.NaN;
+	private static double centerZ;
+	private static float zoom = 1f;
+	private static boolean follow = true;
+	private static boolean grid;
+	private static boolean showWaypoints = true;
+	private static String viewedDimension;
+	private static Integer caveBand;
+
+	private final List<VeloUi.Hit> hits = new ArrayList<>();
+	private float targetZoom = zoom;
+	private boolean dragging;
+	private double dragged;
+	private double[] menuAt;
+	/** The waypoint under the cursor when the menu was opened (right-click on a waypoint), else null. */
+	private Waypoint menuWaypoint;
+	private boolean armedDelete;
+	private static boolean clickTeleport = true;
+	private long lastNanos;
+	/** The store the zoomed-out tiles were last refreshed for (each time the map opens / the layer changes). */
+	private MapStore lodStore;
+	private boolean loading;
+
+	/** Zoom every time the map opens: about 240 blocks across a 1080p screen - your surroundings, readable. */
+	private static final float OPEN_ZOOM = 2f;
+
+	public WorldMapScreen(Screen parent) {
+		super(Text.literal("World Map"), 10_000, 10_000);
+		returnTo(parent);
+		// Every open starts on you: your dimension, following you, at a zoom where you can see what's around you.
+		String current = WorldMap.currentDimension();
+		if (current != null) {
+			viewedDimension = current;
+		}
+		follow = true;
+		zoom = OPEN_ZOOM;
+		targetZoom = OPEN_ZOOM;
+		double[] player = MapCompat.player();
+		if (player != null) {
+			centerX = player[0];
+			centerZ = player[2];
+		}
+	}
+
+	/** Dev-only (screenshot tour). */
+	public static void tourLayer(int index) {
+		layer = Layer.values()[index];
+	}
+
+	@Override
+	protected void layoutContent() {
+		this.clearChildren();
+	}
+
+	@Override
+	public void removed() {
+		WorldMap.flush();
+		super.removed();
+	}
+
+	private int mapTop() {
+		return contentY() + 24;
+	}
+
+	private int mapBottom() {
+		return contentBottom() - 16;
+	}
+
+	private int mapCenterX() {
+		return contentX() + contentWidth() / 2;
+	}
+
+	private int mapCenterY() {
+		return (mapTop() + mapBottom()) / 2;
+	}
+
+	private double blockX(double screenX) {
+		return centerX + (screenX - mapCenterX()) / zoom;
+	}
+
+	private double blockZ(double screenY) {
+		return centerZ + (screenY - mapCenterY()) / zoom;
+	}
+
+	private float screenX(double blockX) {
+		return (float) (mapCenterX() + (blockX - centerX) * zoom);
+	}
+
+	private float screenY(double blockZ) {
+		return (float) (mapCenterY() + (blockZ - centerZ) * zoom);
+	}
+
+	private MapStore store() {
+		String world = WorldMap.currentWorld();
+		if (world == null || viewedDimension == null) {
+			return null;
+		}
+		if (layer == Layer.CAVES) {
+			Integer band = caveBand != null ? caveBand : playerBand();
+			return band == null ? null : WorldMap.store(world, viewedDimension, "cave" + band);
+		}
+		return WorldMap.store(world, viewedDimension, "surface");
+	}
+
+	private Integer playerBand() {
+		double[] player = MapCompat.player();
+		return player == null ? null : Math.floorDiv((int) Math.floor(player[1]), 16);
+	}
+
+	/** Cave levels recorded so far in the viewed dimension. */
+	private List<Integer> caveBands() {
+		List<Integer> bands = new ArrayList<>();
+		String world = WorldMap.currentWorld();
+		if (world == null || viewedDimension == null) {
+			return bands;
+		}
+		var dir = WorldMap.root().resolve(WorldMap.safe(world)).resolve(WorldMap.safe(viewedDimension));
+		try (var files = Files.list(dir)) {
+			files.map(p -> p.getFileName().toString()).filter(n -> n.startsWith("cave")).forEach(n -> {
+				try {
+					bands.add(Integer.parseInt(n.substring(4)));
+				} catch (NumberFormatException ignored) {
+					// not a band folder
+				}
+			});
+		} catch (Exception ignored) {
+			// nothing recorded yet
+		}
+		Integer current = playerBand();
+		if (current != null && !bands.contains(current)) {
+			bands.add(current);
+		}
+		bands.sort(null);
+		return bands;
+	}
+
+	@Override
+	public void render(DrawContext context, int mouseX, int mouseY, float delta) {
+		long now = System.nanoTime();
+		float dt = lastNanos == 0 ? 0.016f : Math.min(0.1f, (now - lastNanos) / 1e9f);
+		lastNanos = now;
+		// Smooth zoom toward the target, keeping the point under the cursor in place.
+		if (Math.abs(targetZoom - zoom) > 0.0005f) {
+			double anchorX = blockX(mouseX);
+			double anchorZ = blockZ(mouseY);
+			boolean insideMap = mouseY >= mapTop() && mouseY < mapBottom();
+			zoom += (targetZoom - zoom) * Math.min(1f, dt * 14f);
+			if (insideMap && !follow) {
+				centerX += anchorX - blockX(mouseX);
+				centerZ += anchorZ - blockZ(mouseY);
+			}
+		}
+		double[] player = MapCompat.player();
+		if (follow && player != null) {
+			centerX = player[0];
+			centerZ = player[2];
+		}
+		super.render(context, mouseX, mouseY, delta);
+		hits.clear();
+		MapTextures.beginFrame();
+		MapStore.beginFrame();
+		MapLod.beginFrame();
+		loading = false;
+		int left = contentX();
+		int right = contentX() + contentWidth();
+		int top = mapTop();
+		int bottom = mapBottom();
+
+		VeloDraw.fillRounded(context, left, top, right - left, bottom - top, 8, 0xFF0D0D10);
+		context.enableScissor(left, top, right, bottom);
+		MapStore store = store();
+		int regionsDrawn = 0;
+		if (store != null) {
+			MapTextures.Style style = switch (layer) {
+				case TOPOGRAPHY -> MapTextures.Style.TOPOGRAPHY;
+				case BIOMES -> MapTextures.Style.BIOMES;
+				default -> MapTextures.Style.SURFACE;
+			};
+			// Detail level: texels about as big as the screen's pixels (level L = 2^L blocks per texel).
+			double pxPerBlock = zoom * context.getMatrices().m00() * net.veloclient.velo.client.util.ClientCompat.guiScale();
+			int level = pxPerBlock >= 1 ? 0 : Math.min(MapLod.MAX_LEVEL, (int) Math.floor(Math.log(1 / pxPerBlock) / Math.log(2)));
+			if (lodStore != store) {
+				lodStore = store;
+				MapLod.refresh(store);
+			}
+			int tileBlocks = MapRegion.SIZE << level;
+			int minTx = (int) Math.floor(blockX(left) / tileBlocks);
+			int maxTx = (int) Math.floor(blockX(right) / tileBlocks);
+			int minTz = (int) Math.floor(blockZ(top) / tileBlocks);
+			int maxTz = (int) Math.floor(blockZ(bottom) / tileBlocks);
+			for (int tx = minTx; tx <= maxTx; tx++) {
+				for (int tz = minTz; tz <= maxTz; tz++) {
+					if (level == 0) {
+						MapRegion region = store.regionForDraw(tx, tz);
+						Identifier tex = region == null ? null : MapTextures.texture(store, region, style);
+						if (tex == null) {
+							// Not read yet: the zoomed-out tile above it (if it's around) stands in.
+							Identifier parent = MapLod.cached(store, style, 1, tx >> 1, tz >> 1);
+							if (parent != null) {
+								drawTile(context, parent, 1, tx >> 1, tz >> 1);
+							}
+							continue;
+						}
+						drawTile(context, tex, 0, tx, tz);
+						regionsDrawn++;
+						continue;
+					}
+					if (!MapLod.mayHave(store, level, tx, tz)) {
+						continue;
+					}
+					Identifier tex = MapLod.texture(store, style, level, tx, tz);
+					if (tex == null) {
+						// Still building: show the sharper tiles already there.
+						for (int q = 0; q < 4; q++) {
+							int cx = tx * 2 + (q & 1);
+							int cz = tz * 2 + (q >> 1);
+							Identifier child = level == 1 ? MapTextures.cachedOnly(store, cx, cz, style) : MapLod.cached(store, style, level - 1, cx, cz);
+							if (child != null) {
+								drawTile(context, child, level - 1, cx, cz);
+							}
+						}
+						loading = true;
+						continue;
+					}
+					drawTile(context, tex, level, tx, tz);
+					regionsDrawn++;
+				}
+			}
+		}
+		if (grid) {
+			drawGrid(context, left, top, right, bottom);
+		}
+		if (showWaypoints) {
+			drawWaypoints(context, mouseX, mouseY);
+		}
+		PartyLocator.pollIfDue();
+		drawPartyMembers(context, mouseX, mouseY);
+		if (player != null && WorldMap.currentDimension() != null && WorldMap.currentDimension().equals(viewedDimension)) {
+			drawPlayer(context, screenX(player[0]), screenY(player[2]), (float) player[3]);
+		}
+		if (regionsDrawn == 0 && !loading && (store == null || MapLod.indexed(store))) {
+			boolean nothingAtAll = store != null && !MapLod.anything(store);
+			String message = store == null ? "Join a world to start mapping." : !nothingAtAll ? "Nothing explored in this area yet." : layer == Layer.CAVES
+					? "No caves recorded at this level yet - go underground to map them."
+					: "Nothing explored here yet - walk around and the map fills in.";
+			context.drawTextWithShadow(this.textRenderer, message, mapCenterX() - this.textRenderer.getWidth(message) / 2, mapCenterY() + 18,
+					VeloStyle.textMuted());
+		}
+		context.disableScissor();
+
+		drawToolbar(context, mouseX, mouseY);
+		drawStatus(context, mouseX, mouseY, store);
+		if (menuAt != null) {
+			if (menuWaypoint != null) {
+				drawWaypointMenu(context, mouseX, mouseY);
+			} else {
+				drawMenu(context, mouseX, mouseY);
+			}
+		}
+	}
+
+	/** A tile of the map (a region at level 0) at its place and size. */
+	private void drawTile(DrawContext context, Identifier texture, int level, int tx, int tz) {
+		double blocks = (double) MapRegion.SIZE * (1 << level);
+		context.getMatrices().pushMatrix();
+		context.getMatrices().translate(screenX(tx * blocks), screenY(tz * blocks));
+		context.getMatrices().scale(zoom * (1 << level), zoom * (1 << level));
+		context.drawTexture(RenderPipelines.GUI_TEXTURED, texture, 0, 0, 0f, 0f, MapRegion.SIZE, MapRegion.SIZE,
+				MapRegion.SIZE, MapRegion.SIZE, MapRegion.SIZE, MapRegion.SIZE);
+		context.getMatrices().popMatrix();
+	}
+
+	private void drawGrid(DrawContext context, int left, int top, int right, int bottom) {
+		int step = zoom >= 1.5f ? 16 : zoom >= 0.15f ? MapRegion.SIZE : 0;
+		if (step == 0) {
+			return;
+		}
+		double startX = Math.floor(blockX(left) / step) * step;
+		for (double bx = startX; screenX(bx) < right; bx += step) {
+			int sx = Math.round(screenX(bx));
+			boolean region = Math.floorMod((long) bx, MapRegion.SIZE) == 0;
+			context.fill(sx, top, sx + 1, bottom, region ? 0x50FFFFFF : 0x22FFFFFF);
+		}
+		double startZ = Math.floor(blockZ(top) / step) * step;
+		for (double bz = startZ; screenY(bz) < bottom; bz += step) {
+			int sy = Math.round(screenY(bz));
+			boolean region = Math.floorMod((long) bz, MapRegion.SIZE) == 0;
+			context.fill(left, sy, right, sy + 1, region ? 0x50FFFFFF : 0x22FFFFFF);
+		}
+	}
+
+	/** The enabled waypoint under the cursor (same radius the map uses for hover), or null. */
+	private Waypoint waypointAt(double mouseX, double mouseY) {
+		String world = WorldMap.currentWorld();
+		if (world == null || !showWaypoints) {
+			return null;
+		}
+		Waypoint best = null;
+		double bestDistance = Double.MAX_VALUE;
+		for (Waypoint waypoint : WaypointManager.inWorldAndDimension(world, viewedDimension)) {
+			if (!waypoint.enabled) {
+				continue;
+			}
+			double distance = Math.hypot(mouseX - screenX(waypoint.x), mouseY - screenY(waypoint.z));
+			if (distance < (waypoint.death ? 4 : 5) + 4 && distance < bestDistance) {
+				best = waypoint;
+				bestDistance = distance;
+			}
+		}
+		return best;
+	}
+
+	/** Creative with a usable /tp: a plain click on the map teleports there. */
+	private boolean clickTeleportAvailable() {
+		var player = this.client == null ? null : this.client.player;
+		return player != null && player.isCreative() && WaypointTeleport.available();
+	}
+
+	private void drawWaypoints(DrawContext context, int mouseX, int mouseY) {
+		String world = WorldMap.currentWorld();
+		if (world == null) {
+			return;
+		}
+		for (Waypoint waypoint : WaypointManager.inWorldAndDimension(world, viewedDimension)) {
+			if (!waypoint.enabled) {
+				continue;
+			}
+			float sx = screenX(waypoint.x);
+			float sy = screenY(waypoint.z);
+			int r = waypoint.death ? 4 : 5;
+			VeloDraw.fillCircle(context, sx, sy, r + 1.5f, 0xFF000000);
+			VeloDraw.fillCircle(context, sx, sy, r, waypoint.color | 0xFF000000);
+			if (waypoint.death) {
+				VeloDraw.cross(context, sx, sy, 3.5f, 1.2f, 0xFFFFFFFF);
+			}
+			boolean hovered = Math.hypot(mouseX - sx, mouseY - sy) < r + 3;
+			if (hovered || zoom >= 0.6f) {
+				String label = waypoint.name + (hovered && WorldMapModule.showCoordinates()
+						? "  " + (int) Math.floor(waypoint.x) + ", " + (int) Math.floor(waypoint.z) : "");
+				int tw = this.textRenderer.getWidth(label) + 8;
+				VeloDraw.fillRounded(context, Math.round(sx - tw / 2f), Math.round(sy + r + 3), tw, 12, 4, 0xC0101014);
+				context.drawTextWithShadow(this.textRenderer, label, Math.round(sx - tw / 2f) + 4, Math.round(sy + r + 5), 0xFFFFFFFF);
+			}
+		}
+	}
+
+	/** The player as an arrow pointing where they look (north = up). */
+	private void drawPlayer(DrawContext context, float x, float y, float yaw) {
+		drawArrow(context, x, y, yaw, 0xFFFFFFFF, VeloStyle.accent());
+	}
+
+	/** Party members who share their live position, each as an arrow in their own colour with their name. */
+	private void drawPartyMembers(DrawContext context, int mouseX, int mouseY) {
+		String world = WorldMap.currentWorld();
+		for (PartyLocator.Member member : PartyLocator.members()) {
+			if (!member.dimension().equals(viewedDimension) || world == null || !member.world().equals(world)) {
+				continue;
+			}
+			int color = WaypointManager.PALETTE[Math.floorMod(member.name().hashCode(), WaypointManager.PALETTE.length)] | 0xFF000000;
+			float sx = screenX(member.x());
+			float sy = screenY(member.z());
+			drawArrow(context, sx, sy, (float) member.yaw(), color, 0xFF000000);
+			int tw = this.textRenderer.getWidth(member.name()) + 8;
+			VeloDraw.fillRounded(context, Math.round(sx - tw / 2f), Math.round(sy + 11), tw, 12, 4, 0xC0101014);
+			context.drawTextWithShadow(this.textRenderer, member.name(), Math.round(sx - tw / 2f) + 4, Math.round(sy + 13), color);
+		}
+	}
+
+	/** A direction arrow: {@code fill} inside, {@code outline} around it. */
+	private void drawArrow(DrawContext context, float x, float y, float yaw, int fill, int outline) {
+		// Yaw 0 looks south (+Z = down the screen), 90 west: the facing vector on the map is (-sin yaw, +cos yaw).
+		double angle = Math.toRadians(yaw);
+		float size = 7;
+		float tipX = (float) (x - Math.sin(angle) * size);
+		float tipY = (float) (y + Math.cos(angle) * size);
+		float leftX = (float) (x - Math.sin(angle + 2.5) * size * 0.8);
+		float leftY = (float) (y + Math.cos(angle + 2.5) * size * 0.8);
+		float rightX = (float) (x - Math.sin(angle - 2.5) * size * 0.8);
+		float rightY = (float) (y + Math.cos(angle - 2.5) * size * 0.8);
+		VeloDraw.fillCircle(context, x, y, 9, 0x50000000);
+		for (float t = 0; t <= 1; t += 0.1f) {
+			// Filled by sweeping lines from the tip to the back edge.
+			float bx = leftX + (rightX - leftX) * t;
+			float by = leftY + (rightY - leftY) * t;
+			VeloDraw.line(context, tipX, tipY, bx, by, 1.6f, fill);
+		}
+		VeloDraw.line(context, tipX, tipY, leftX, leftY, 1.4f, outline);
+		VeloDraw.line(context, tipX, tipY, rightX, rightY, 1.4f, outline);
+		VeloDraw.line(context, leftX, leftY, x, y, 1.4f, outline);
+		VeloDraw.line(context, rightX, rightY, x, y, 1.4f, outline);
+	}
+
+	private void drawToolbar(DrawContext context, int mouseX, int mouseY) {
+		int x = contentX();
+		int y = contentY();
+		for (Layer l : Layer.values()) {
+			int w = this.textRenderer.getWidth(l.label) + 16;
+			hits.add(VeloUi.pill(context, x, y, w, 16, l.label, layer == l ? 1 : 0, mouseX, mouseY, () -> {
+				layer = l;
+				caveBand = null;
+			}));
+			x += w + 4;
+		}
+		if (layer == Layer.CAVES) {
+			List<Integer> bands = caveBands();
+			Integer band = caveBand != null ? caveBand : playerBand();
+			if (band != null) {
+				x += 6;
+				hits.add(VeloUi.pill(context, x, y, 16, 16, "-", 0, mouseX, mouseY, () -> caveBand = step(bands, band, -1)));
+				String level = "Y " + band * 16 + " to " + (band * 16 + 15);
+				int lw = this.textRenderer.getWidth(level) + 12;
+				context.drawTextWithShadow(this.textRenderer, level, x + 22, y + 4, VeloStyle.text());
+				hits.add(VeloUi.pill(context, x + 22 + lw, y, 16, 16, "+", 0, mouseX, mouseY, () -> caveBand = step(bands, band, 1)));
+				x += 22 + lw + 22;
+			}
+		}
+		// Dimension: one button that cycles through them.
+		String[][] dims = {{"minecraft:overworld", "Overworld"}, {"minecraft:the_nether", "Nether"}, {"minecraft:the_end", "End"}};
+		int current = 0;
+		for (int i = 0; i < dims.length; i++) {
+			if (dims[i][0].equals(viewedDimension)) {
+				current = i;
+			}
+		}
+		String dimLabel = dims[current][1] + "  >";
+		int dw = this.textRenderer.getWidth(dimLabel) + 16;
+		int next = (current + 1) % dims.length;
+		hits.add(VeloUi.pill(context, contentX() + contentWidth() - dw, y, dw, 16, dimLabel, 0, mouseX, mouseY, () -> {
+			viewedDimension = dims[next][0];
+			follow = false;
+		}));
+
+		// View controls float in the map's top-right corner.
+		int rx = contentX() + contentWidth() - 6;
+		int cy = mapTop() + 6;
+		rx -= 20;
+		hits.add(VeloUi.pill(context, rx, cy, 20, 16, "+", 0, mouseX, mouseY, () -> targetZoom = Math.min(16f, targetZoom * 1.5f)));
+		rx -= 24;
+		hits.add(VeloUi.pill(context, rx, cy, 20, 16, "-", 0, mouseX, mouseY, () -> targetZoom = Math.max(0.01f, targetZoom / 1.5f)));
+		java.util.List<Object[]> toggles = new ArrayList<>(List.of(
+				new Object[] {"Follow me", follow, (Runnable) () -> follow = !follow},
+				new Object[] {"Waypoints", showWaypoints, (Runnable) () -> showWaypoints = !showWaypoints},
+				new Object[] {"Grid", grid, (Runnable) () -> grid = !grid}));
+		if (PartyLocator.available()) {
+			toggles.add(new Object[] {"Share my position", PartyLocator.sharing(), (Runnable) () -> PartyLocator.setSharing(!PartyLocator.sharing())});
+		}
+		if (clickTeleportAvailable()) {
+			toggles.add(new Object[] {"Click to teleport", clickTeleport, (Runnable) () -> clickTeleport = !clickTeleport});
+		}
+		for (Object[] toggle : toggles) {
+			String label = (String) toggle[0];
+			int w = this.textRenderer.getWidth(label) + 14;
+			rx -= w + 4;
+			hits.add(VeloUi.pill(context, rx, cy, w, 16, label, (Boolean) toggle[1] ? 1 : 0, mouseX, mouseY, (Runnable) toggle[2]));
+		}
+	}
+
+	private static Integer step(List<Integer> bands, int current, int direction) {
+		if (bands.isEmpty()) {
+			return current + direction;
+		}
+		int index = bands.indexOf(current);
+		if (index < 0) {
+			return bands.get(0);
+		}
+		return bands.get(Math.max(0, Math.min(bands.size() - 1, index + direction)));
+	}
+
+	private void drawStatus(DrawContext context, int mouseX, int mouseY, MapStore store) {
+		int y = contentBottom() - 11;
+		String text;
+		if (mouseY >= mapTop() && mouseY < mapBottom()) {
+			int bx = (int) Math.floor(blockX(mouseX));
+			int bz = (int) Math.floor(blockZ(mouseY));
+			text = WorldMapModule.showCoordinates() ? "X " + bx + "   Z " + bz : "";
+			if (store != null) {
+				MapRegion region = store.region(Math.floorDiv(bx, MapRegion.SIZE), Math.floorDiv(bz, MapRegion.SIZE), false);
+				if (region != null) {
+					int i = Math.floorMod(bz, MapRegion.SIZE) * MapRegion.SIZE + Math.floorMod(bx, MapRegion.SIZE);
+					if (region.rgb[i] != 0) {
+						String biome = store.biomeName(region.biome[i]);
+						biome = biome.contains(":") ? biome.substring(biome.indexOf(':') + 1) : biome;
+						if (WorldMapModule.showCoordinates()) {
+							text += "   Y " + region.height[i];
+						}
+						if (WorldMapModule.showBiomes()) {
+							text += "   " + biome.replace('_', ' ');
+						}
+					}
+				}
+			}
+		} else {
+			text = "";
+		}
+		context.drawTextWithShadow(this.textRenderer, text, contentX(), y, VeloStyle.text());
+		String help = "Drag to move  ·  scroll to zoom  ·  right-click for waypoints"
+				+ (clickTeleport && clickTeleportAvailable() ? "  ·  click to teleport" : "") + "  ·  " + Math.round(zoom * 100) + "%";
+		context.drawTextWithShadow(this.textRenderer, help, contentX() + contentWidth() - this.textRenderer.getWidth(help), y, VeloStyle.textFaint());
+	}
+
+	private void drawMenu(DrawContext context, int mouseX, int mouseY) {
+		int mx = (int) menuAt[0];
+		int my = (int) menuAt[1];
+		int bx = (int) Math.floor(menuAt[2]);
+		int bz = (int) Math.floor(menuAt[3]);
+		int w = 150;
+		boolean coords = WorldMapModule.showCoordinates();
+		boolean teleport = net.veloclient.velo.client.waypoints.WaypointTeleport.available();
+		boolean party = net.veloclient.velo.client.network.SocialClient.inParty();
+		int menuHeight = (coords ? 58 : 40) + (teleport ? 20 : 0) + (party ? 20 : 0);
+		VeloDraw.fillRounded(context, mx, my, w, menuHeight, 7, 0xF0141418);
+		VeloDraw.strokeRounded(context, mx, my, w, menuHeight, 7, VeloStyle.border());
+		context.drawTextWithShadow(this.textRenderer, coords ? "X " + bx + ", Z " + bz : "Here", mx + 8, my + 6, VeloStyle.textMuted());
+		hits.add(0, VeloUi.pill(context, mx + 4, my + 18, w - 8, 16, "Add waypoint here", 1, mouseX, mouseY, () -> {
+			menuAt = null;
+			int y = surfaceY(bx, bz);
+			this.client.setScreen(WaypointEditScreen.createAt(this, WorldMap.currentWorld(), viewedDimension, bx, y, bz));
+		}));
+		if (coords) {
+			hits.add(0, VeloUi.pill(context, mx + 4, my + 38, w - 8, 16, "Copy coordinates", 0, mouseX, mouseY, () -> {
+				menuAt = null;
+				MinecraftClient.getInstance().keyboard.setClipboard(bx + " " + surfaceY(bx, bz) + " " + bz);
+			}));
+		}
+		if (party) {
+			int py = my + (coords ? 58 : 38);
+			hits.add(0, VeloUi.pill(context, mx + 4, py, w - 8, 16, "Share spot with party", 0, mouseX, mouseY, () -> {
+				menuAt = null;
+				java.util.Map<String, Object> spot = new java.util.LinkedHashMap<>();
+				spot.put("name", net.veloclient.velo.client.serverpacks.ServerData.localName() + "'s spot");
+				spot.put("x", bx);
+				spot.put("y", surfaceY(bx, bz));
+				spot.put("z", bz);
+				spot.put("dimension", viewedDimension);
+				spot.put("world", WorldMap.currentWorld());
+				spot.put("color", net.veloclient.velo.client.waypoints.WaypointManager.nextColor());
+				net.veloclient.velo.client.network.SocialClient.partyWaypoint(spot);
+			}));
+		}
+		if (teleport) {
+			hits.add(0, VeloUi.pill(context, mx + 4, my + menuHeight - 20, w - 8, 16, "Teleport here", 0, mouseX, mouseY, () -> {
+				menuAt = null;
+				net.veloclient.velo.client.waypoints.WaypointTeleport.teleport(bx, surfaceY(bx, bz), bz, viewedDimension);
+				this.close();
+			}));
+		}
+	}
+
+	/** Right-click on an existing waypoint: edit, share, teleport, delete. */
+	private void drawWaypointMenu(DrawContext context, int mouseX, int mouseY) {
+		Waypoint waypoint = menuWaypoint;
+		int mx = (int) menuAt[0];
+		int my = (int) menuAt[1];
+		int w = 156;
+		List<Object[]> entries = new ArrayList<>();
+		entries.add(new Object[] {"Edit waypoint", 1, (Runnable) () -> {
+			menuAt = null;
+			menuWaypoint = null;
+			this.client.setScreen(WaypointEditScreen.edit(this, waypoint));
+		}});
+		entries.add(new Object[] {"Share in chat", 0, (Runnable) () -> {
+			menuAt = null;
+			menuWaypoint = null;
+			WaypointManager.shareInChat(waypoint);
+		}});
+		entries.add(new Object[] {"Share with friends / party...", 0, (Runnable) () -> {
+			menuAt = null;
+			menuWaypoint = null;
+			this.client.setScreen(new net.veloclient.velo.client.gui.WaypointShareScreen(this, waypoint));
+		}});
+		if (WaypointTeleport.available()) {
+			entries.add(new Object[] {"Teleport here", 0, (Runnable) () -> {
+				menuAt = null;
+				menuWaypoint = null;
+				WaypointTeleport.teleport(waypoint.x, waypoint.y, waypoint.z, waypoint.dimension);
+				this.close();
+			}});
+		}
+		entries.add(new Object[] {armedDelete ? "Click again to delete" : "Delete waypoint", armedDelete ? 3 : 0, (Runnable) () -> {
+			if (!armedDelete) {
+				armedDelete = true;
+				return;
+			}
+			armedDelete = false;
+			menuAt = null;
+			menuWaypoint = null;
+			WaypointManager.delete(waypoint);
+		}});
+		int menuHeight = 24 + entries.size() * 20;
+		VeloDraw.fillRounded(context, mx, my, w, menuHeight, 7, 0xF0141418);
+		VeloDraw.strokeRounded(context, mx, my, w, menuHeight, 7, VeloStyle.border());
+		context.drawTextWithShadow(this.textRenderer, VeloUi.trim(waypoint.name, w - 16), mx + 8, my + 6, waypoint.color | 0xFF000000);
+		int y = my + 20;
+		for (Object[] entry : entries) {
+			hits.add(0, VeloUi.pill(context, mx + 4, y, w - 8, 16, (String) entry[0], (Integer) entry[1], mouseX, mouseY, (Runnable) entry[2]));
+			y += 20;
+		}
+	}
+
+	private int surfaceY(int bx, int bz) {
+		MapStore store = store();
+		if (store != null) {
+			MapRegion region = store.region(Math.floorDiv(bx, MapRegion.SIZE), Math.floorDiv(bz, MapRegion.SIZE), false);
+			if (region != null) {
+				int i = Math.floorMod(bz, MapRegion.SIZE) * MapRegion.SIZE + Math.floorMod(bx, MapRegion.SIZE);
+				if (region.rgb[i] != 0) {
+					return region.height[i] + 1;
+				}
+			}
+		}
+		double[] player = MapCompat.player();
+		return player == null ? 64 : (int) Math.floor(player[1]);
+	}
+
+	// ---- Input ----
+
+	@Override
+	public boolean mouseClicked(Click click, boolean doubled) {
+		for (VeloUi.Hit hit : List.copyOf(hits)) {
+			if (hit.contains(click.x(), click.y())) {
+				hit.action().run();
+				return true;
+			}
+		}
+		if (menuAt != null) {
+			menuAt = null;
+			menuWaypoint = null;
+			armedDelete = false;
+			return true;
+		}
+		if (click.y() >= mapTop() && click.y() < mapBottom() && click.x() >= contentX() && click.x() < contentX() + contentWidth()) {
+			if (click.button() == net.veloclient.velo.client.util.Keys.MOUSE_RIGHT) {
+				menuWaypoint = waypointAt(click.x(), click.y());
+				armedDelete = false;
+				int menuWidth = menuWaypoint != null ? 160 : 152;
+				int menuHeight = menuWaypoint != null ? 24 + 5 * 20 : 96;
+				menuAt = new double[] {Math.min(click.x(), contentX() + contentWidth() - menuWidth), Math.min(click.y(), mapBottom() - menuHeight),
+						blockX(click.x()), blockZ(click.y())};
+				return true;
+			}
+			dragging = true;
+			dragged = 0;
+			return true;
+		}
+		return super.mouseClicked(click, doubled);
+	}
+
+	@Override
+	public boolean mouseDragged(Click click, double offsetX, double offsetY) {
+		if (dragging) {
+			dragged += Math.abs(offsetX) + Math.abs(offsetY);
+			if (dragged > 2) {
+				follow = false;
+			}
+			centerX -= offsetX / zoom;
+			centerZ -= offsetY / zoom;
+			return true;
+		}
+		return super.mouseDragged(click, offsetX, offsetY);
+	}
+
+	@Override
+	public boolean mouseReleased(Click click) {
+		boolean wasClick = dragging && dragged <= 2 && click.button() == net.veloclient.velo.client.util.Keys.MOUSE_LEFT;
+		dragging = false;
+		if (wasClick && menuAt == null && clickTeleport && clickTeleportAvailable()
+				&& click.y() >= mapTop() && click.y() < mapBottom() && click.x() >= contentX() && click.x() < contentX() + contentWidth()) {
+			Waypoint target = waypointAt(click.x(), click.y());
+			if (target != null) {
+				WaypointTeleport.teleport(target.x, target.y, target.z, target.dimension);
+			} else {
+				int bx = (int) Math.floor(blockX(click.x()));
+				int bz = (int) Math.floor(blockZ(click.y()));
+				WaypointTeleport.teleport(bx, surfaceY(bx, bz), bz, viewedDimension);
+			}
+			this.close();
+			return true;
+		}
+		return super.mouseReleased(click);
+	}
+
+	@Override
+	public boolean mouseScrolled(double mouseX, double mouseY, double horizontalAmount, double verticalAmount) {
+		targetZoom = Math.max(0.01f, Math.min(16f, targetZoom * (verticalAmount > 0 ? 1.25f : 0.8f)));
+		return true;
+	}
+
+	@Override
+	public boolean keyPressed(net.minecraft.client.input.KeyInput input) {
+		if (input.key() == WorldMapKeys.keyCode() && menuAt == null) {
+			requestClose();
+			return true;
+		}
+		if (input.key() == net.veloclient.velo.client.util.Keys.SPACE) {
+			follow = true;
+			return true;
+		}
+		return super.keyPressed(input);
+	}
+
+	@Override
+	public boolean shouldPause() {
+		return false;
+	}
+}

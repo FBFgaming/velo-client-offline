@@ -1,0 +1,61 @@
+package net.veloclient.velo.module;
+
+/**
+ * A single toggleable feature. Implementations must be side-effect-free
+ * outside {@link #onEnable()}/{@link #onDisable()} so the registry can be
+ * introspected safely to build the manifest, the launcher's mod browser and
+ * the in-game panel from one source of truth (design spec section 8).
+ */
+public interface Module {
+
+	/** Stable, lowercase-hyphenated identifier. Never rename once shipped; profiles reference it. */
+	String id();
+
+	/** Short human-readable name shown in the panel and launcher. */
+	String displayName();
+
+	/** One or two sentences explaining what the module does, for the manifest and panel tooltip. */
+	String description();
+
+	ModuleCategory category();
+
+	SafetyTag safetyTag();
+
+	/** Still in development (shown with a BETA badge): works, but not finished or polished yet. */
+	/** New in this release: the module list shows a small NEW tag. */
+	default boolean isNew() {
+		return NEW.contains(id());
+	}
+
+	/** The modules that are new in the current release (cleared when the next one ships). */
+	java.util.Set<String> NEW = java.util.Set.of("velo-rewind", "numbered-inventories", "color-codes", "shield-indicator");
+
+	default boolean beta() {
+		return false;
+	}
+
+	/** Whether this module ships enabled by default on a fresh profile. */
+	boolean defaultEnabled();
+
+	/**
+	 * Whether a saved profile's enabled state for this module should be restored on startup.
+	 * True for almost everything - false is reserved for modules (automation/bots that walk,
+	 * mine, or run commands on their own) that should always require a deliberate, explicit
+	 * re-enable each session rather than silently resuming wherever they left off.
+	 */
+	default boolean restoreEnabledStateOnLoad() {
+		return true;
+	}
+
+	boolean isEnabled();
+
+	void setEnabled(boolean enabled);
+
+	/** Called when the module transitions from disabled to enabled. */
+	default void onEnable() {
+	}
+
+	/** Called when the module transitions from enabled to disabled. */
+	default void onDisable() {
+	}
+}

@@ -1,0 +1,228 @@
+package net.veloclient.velo.client.mixin;
+
+//? if <26.1 {
+import net.minecraft.client.MinecraftClient;
+import net.minecraft.client.network.AbstractClientPlayerEntity;
+import net.minecraft.entity.player.SkinTextures;
+//? if <1.21.2 {
+/*// (no AssetInfo before 1.21.9)
+*///?} else {
+import net.minecraft.util.AssetInfo;
+//?}
+import net.minecraft.util.Identifier;
+//?} else {
+/*import net.minecraft.client.Minecraft;
+import net.minecraft.client.player.AbstractClientPlayer;
+import net.minecraft.core.ClientAsset;
+import net.minecraft.resources.Identifier;
+import net.minecraft.world.entity.player.PlayerSkin;
+*///?}
+import net.veloclient.velo.client.cosmetics.CapeDefinition;
+import net.veloclient.velo.client.cosmetics.CapeManager;
+import net.veloclient.velo.client.cosmetics.WaveyCapesCompat;
+import org.spongepowered.asm.mixin.Mixin;
+import org.spongepowered.asm.mixin.injection.At;
+import org.spongepowered.asm.mixin.injection.Inject;
+import org.spongepowered.asm.mixin.injection.callback.CallbackInfoReturnable;
+
+/**
+ * Reports the equipped Velo cape (and its bundled elytra texture, if it has
+ * one - see {@link CapeManager#elytraTextureIdentifier}) as the local
+ * player's own vanilla skin textures.
+ *
+ * <p>The cape field is only ever touched while Wavey Capes ({@link
+ * WaveyCapesCompat}) is installed - it has no other way to discover a
+ * cosmetic cape from a mod it doesn't know about, and its own fallback
+ * renderer just reads this same accessor (confirmed by reading its real,
+ * decompiled source). {@link net.veloclient.velo.client.cosmetics.render.CapeFeatureRenderer}
+ * skips registering its own render layer whenever Wavey Capes is present, so
+ * this is the only place a Velo cape gets attached to the local player in
+ * that case - the rest of the time (Wavey Capes absent) Velo's own
+ * ClothCape-driven render layer handles the cape directly instead.
+ *
+ * <p>The elytra field, unlike the cape one, is touched unconditionally
+ * (Wavey Capes or not) - real elytra rendering is 100% vanilla's own system
+ * either way (confirmed via the real {@code equipment/elytra.json} asset,
+ * which already supports {@code "use_player_texture": true"} - the exact
+ * same per-player-skin mechanism this mixin hooks for the cape), so there's
+ * nothing Wavey-Capes-specific about it at all.
+ */
+//? if <1.21.2 {
+/*@Mixin(AbstractClientPlayerEntity.class)
+public abstract class LocalPlayerSkinCapeMixin {
+
+	// 1.21.1: SkinTextures holds the texture identifiers directly (texture, url, cape, elytra, model, secure).
+	@Inject(method = "getSkinTextures", at = @At("RETURN"), cancellable = true)
+	private void velo$tryOnSkin(CallbackInfoReturnable<SkinTextures> cir) {
+		Identifier skin = net.veloclient.velo.client.skins.SkinTryOn.texture();
+		if (skin == null || (Object) this != MinecraftClient.getInstance().player) {
+			return;
+		}
+		SkinTextures original = cir.getReturnValue();
+		cir.setReturnValue(new SkinTextures(skin, null, original.capeTexture(), original.elytraTexture(),
+				net.veloclient.velo.client.skins.SkinTryOn.slim() ? SkinTextures.Model.SLIM : SkinTextures.Model.WIDE, original.secure()));
+	}
+
+	@Inject(method = "getSkinTextures", at = @At("RETURN"), cancellable = true)
+	private void velo$overrideCapeAndElytra(CallbackInfoReturnable<SkinTextures> cir) {
+		java.util.Optional<CapeDefinition> equipped;
+		if ((Object) this == MinecraftClient.getInstance().player) {
+			equipped = CapeManager.renderCape();
+		} else {
+			AbstractClientPlayerEntity self = (AbstractClientPlayerEntity) (Object) this;
+			equipped = net.veloclient.velo.client.cosmetics.RemoteCapeCache.resolve(
+					net.veloclient.velo.client.network.VeloUserRegistry.capeIdFor(self.getUuid(), self.getGameProfile().getName()));
+		}
+		if (equipped.isEmpty()) {
+			return;
+		}
+		CapeDefinition definition = equipped.get();
+		boolean overrideCape = net.veloclient.velo.client.modules.cosmetics.CapeCosmeticsModule.waveyActive();
+		boolean hideCape = WaveyCapesCompat.isLoaded() && !overrideCape;
+		var elytraTexture = ((AbstractClientPlayerEntity) (Object) this).getEquippedStack(net.minecraft.entity.EquipmentSlot.CHEST).getItem()
+				== net.minecraft.item.Items.ELYTRA ? CapeManager.elytraTextureIdentifier(definition) : java.util.Optional.<Identifier>empty();
+		if (!overrideCape && !hideCape && elytraTexture.isEmpty()) {
+			return;
+		}
+		SkinTextures original = cir.getReturnValue();
+		Identifier cape = hideCape ? null : original.capeTexture();
+		if (overrideCape) {
+			Identifier capeTexture = CapeManager.textureIfReady(definition);
+			if (capeTexture != null) {
+				cape = capeTexture;
+			}
+		}
+		Identifier elytra = elytraTexture.orElse(original.elytraTexture());
+		cir.setReturnValue(new SkinTextures(original.texture(), original.textureUrl(), cape, elytra, original.model(), original.secure()));
+	}
+}
+*///?} else if <26.1 {
+@Mixin(AbstractClientPlayerEntity.class)
+public abstract class LocalPlayerSkinCapeMixin {
+
+	/** The Locker's Skin tab trying a skin on you (runs before the cape override below, which keeps the body). */
+	@Inject(method = "getSkin", at = @At("RETURN"), cancellable = true)
+	private void velo$tryOnSkin(CallbackInfoReturnable<SkinTextures> cir) {
+		Identifier skin = net.veloclient.velo.client.skins.SkinTryOn.texture();
+		if (skin == null || (Object) this != MinecraftClient.getInstance().player) {
+			return;
+		}
+		SkinTextures original = cir.getReturnValue();
+		cir.setReturnValue(new SkinTextures(new AssetInfo.TextureAssetInfo(skin, skin), original.cape(), original.elytra(),
+				net.veloclient.velo.client.skins.SkinTryOn.slim() ? net.minecraft.entity.player.PlayerSkinType.SLIM
+						: net.minecraft.entity.player.PlayerSkinType.WIDE, original.secure()));
+	}
+
+	@Inject(method = "getSkin", at = @At("RETURN"), cancellable = true)
+	private void velo$overrideCapeAndElytra(CallbackInfoReturnable<SkinTextures> cir) {
+		java.util.Optional<CapeDefinition> equipped;
+		if ((Object) this == MinecraftClient.getInstance().player) {
+			equipped = CapeManager.renderCape();
+		} else {
+			// Other Velo players: with Wavey Capes installed our own render layer is off, so their
+			// Velo cape has to come through here too - otherwise nobody else's cape ever showed.
+			// Without it only their elytra is touched (their cape art on the wings).
+			AbstractClientPlayerEntity self = (AbstractClientPlayerEntity) (Object) this;
+			equipped = net.veloclient.velo.client.cosmetics.RemoteCapeCache.resolve(
+					net.veloclient.velo.client.network.VeloUserRegistry.capeIdFor(self.getUuid(), self.getGameProfile().name()));
+		}
+		if (equipped.isEmpty()) {
+			return;
+		}
+		CapeDefinition definition = equipped.get();
+		boolean overrideCape = net.veloclient.velo.client.modules.cosmetics.CapeCosmeticsModule.waveyActive();
+		// Wavey Capes installed but Velo picked to draw: report no cape, or Wavey would draw one on top of ours.
+		boolean hideCape = WaveyCapesCompat.isLoaded() && !overrideCape;
+		// Only painted while an elytra is actually worn (it is re-made from the cape art every animation frame).
+		var elytraTexture = ((AbstractClientPlayerEntity) (Object) this).getEquippedStack(net.minecraft.entity.EquipmentSlot.CHEST).getItem()
+				== net.minecraft.item.Items.ELYTRA ? CapeManager.elytraTextureIdentifier(definition) : java.util.Optional.<Identifier>empty();
+		if (!overrideCape && !hideCape && elytraTexture.isEmpty()) {
+			return;
+		}
+		SkinTextures original = cir.getReturnValue();
+		AssetInfo.TextureAsset capeAsset = hideCape ? null : original.cape();
+		if (overrideCape) {
+			// The single-arg TextureAssetInfo(Identifier) constructor does
+			// NOT reuse that identifier as the texturePath - it derives a
+			// DIFFERENT one ("textures/" + path + ".png", confirmed via
+			// javap), meant for real resource-pack-backed assets. Our cape
+			// is dynamically registered directly under `texture` via
+			// TextureManager, so that derived path never resolves - real
+			// bug, rendered as the black/purple missing-texture pattern.
+			// The two-arg constructor with the SAME identifier for both id
+			// and texturePath is what actually binds our registered
+			// texture.
+			Identifier capeTexture = CapeManager.textureIfReady(definition);
+			if (capeTexture != null) {
+				capeAsset = new AssetInfo.TextureAssetInfo(capeTexture, capeTexture);
+			}
+		}
+		AssetInfo.TextureAsset elytraAsset = original.elytra();
+		if (elytraTexture.isPresent()) {
+			Identifier id = elytraTexture.get();
+			elytraAsset = new AssetInfo.TextureAssetInfo(id, id);
+		}
+		cir.setReturnValue(new SkinTextures(original.body(), capeAsset, elytraAsset, original.model(), original.secure()));
+	}
+}
+//?} else {
+/*@Mixin(AbstractClientPlayer.class)
+public abstract class LocalPlayerSkinCapeMixin {
+
+	@Inject(method = "getSkin", at = @At("RETURN"), cancellable = true)
+	private void velo$tryOnSkin(CallbackInfoReturnable<PlayerSkin> cir) {
+		Identifier skin = net.veloclient.velo.client.skins.SkinTryOn.texture();
+		if (skin == null || (Object) this != Minecraft.getInstance().player) {
+			return;
+		}
+		PlayerSkin original = cir.getReturnValue();
+		cir.setReturnValue(new PlayerSkin(new ClientAsset.ResourceTexture(skin, skin), original.cape(), original.elytra(),
+				net.veloclient.velo.client.skins.SkinTryOn.slim() ? net.minecraft.world.entity.player.PlayerModelType.SLIM
+						: net.minecraft.world.entity.player.PlayerModelType.WIDE, original.secure()));
+	}
+
+	@Inject(method = "getSkin", at = @At("RETURN"), cancellable = true)
+	private void velo$overrideCapeAndElytra(CallbackInfoReturnable<PlayerSkin> cir) {
+		java.util.Optional<CapeDefinition> equipped;
+		if ((Object) this == Minecraft.getInstance().player) {
+			equipped = CapeManager.renderCape();
+		} else {
+			AbstractClientPlayer self = (AbstractClientPlayer) (Object) this;
+			equipped = net.veloclient.velo.client.cosmetics.RemoteCapeCache.resolve(
+					net.veloclient.velo.client.network.VeloUserRegistry.capeIdFor(self.getUUID(), self.getGameProfile().name()));
+		}
+		if (equipped.isEmpty()) {
+			return;
+		}
+		CapeDefinition definition = equipped.get();
+		boolean overrideCape = net.veloclient.velo.client.modules.cosmetics.CapeCosmeticsModule.waveyActive();
+		// Wavey Capes installed but Velo picked to draw: report no cape, or Wavey would draw one on top of ours.
+		boolean hideCape = WaveyCapesCompat.isLoaded() && !overrideCape;
+		var elytraTexture = ((AbstractClientPlayer) (Object) this).getItemBySlot(net.minecraft.world.entity.EquipmentSlot.CHEST).getItem()
+				== net.minecraft.world.item.Items.ELYTRA ? CapeManager.elytraTextureIdentifier(definition) : java.util.Optional.<Identifier>empty();
+		if (!overrideCape && !hideCape && elytraTexture.isEmpty()) {
+			return;
+		}
+		PlayerSkin original = cir.getReturnValue();
+		ClientAsset.Texture capeAsset = hideCape ? null : original.cape();
+		if (overrideCape) {
+			// Same real bug/fix as the 1.21.11 branch above: the single-arg
+			// ResourceTexture(Identifier) constructor derives a DIFFERENT
+			// texturePath ("textures/" + path + ".png") instead of reusing
+			// the identifier, which never resolves for our
+			// dynamically-registered texture. Two-arg constructor, same
+			// identifier twice.
+			Identifier capeTexture = CapeManager.textureIfReady(definition);
+			if (capeTexture != null) {
+				capeAsset = new ClientAsset.ResourceTexture(capeTexture, capeTexture);
+			}
+		}
+		ClientAsset.Texture elytraAsset = original.elytra();
+		if (elytraTexture.isPresent()) {
+			Identifier id = elytraTexture.get();
+			elytraAsset = new ClientAsset.ResourceTexture(id, id);
+		}
+		cir.setReturnValue(new PlayerSkin(original.body(), capeAsset, elytraAsset, original.model(), original.secure()));
+	}
+}
+*///?}

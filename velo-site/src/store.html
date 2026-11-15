@@ -1,0 +1,120 @@
+<!--page {
+	"title": "Store – Minecraft Wings, Animated Cloaks & Auras · Velo Client",
+	"description": "The Velo Client Store: animated 3D wings, cloaks, auras, emotes, kill effects and bodywear - hats, glasses, chains, scarves, watches, shoes, backpacks - for Minecraft that every Velo player sees. Sign in with your launcher code, buy with Velo Coins, get Velo+.",
+	"path": "/store",
+	"active": "store",
+	"priority": "0.9",
+	"changefreq": "daily",
+	"images": ["/assets/store/wings_clockwork.webp", "/assets/store/cape_plasma_orb.webp", "/assets/store/wear_top_hat.webp"],
+	"schema": {"@context": "https://schema.org", "@type": "BreadcrumbList", "itemListElement": [{"@type": "ListItem", "position": 1, "name": "Home", "item": "https://velo-client.com/"}, {"@type": "ListItem", "position": 2, "name": "Store", "item": "https://velo-client.com/store"}]}
+}-->
+<div class="wrap" id="store">
+  <header class="store-head">
+    <div>
+      <span class="eyebrow fade-up" style="--d:.05s">Store</span>
+      <h1 data-split style="font-size:clamp(2.4rem,5.4vw,4rem);font-weight:800;letter-spacing:-0.035em">Wings, cloaks &amp; <span class="glow-text">auras</span>.</h1>
+      <p class="fade-up" style="--d:.45s;margin:10px 0 0;color:var(--text-2)">Every Velo player sees them. Try anything on your own skin first - purchases go straight to your Minecraft account.</p>
+      <p class="fade-up welcome-gift" style="--d:.55s;margin:12px 0 0"><span class="pill">Gift</span> Velo Client 1.0 is out: every player picks <strong>one cosmetic for free</strong> - any one in the Store.</p>
+    </div>
+    <div class="wallet fade-up" style="--d:.5s" id="wallet">
+      <button class="btn btn-primary magnetic" type="button" data-signin>Sign in to buy</button>
+    </div>
+  </header>
+
+  <a class="store-discord fade-up" style="--d:.6s" href="{{links.discord}}" rel="noopener" target="_blank">
+    <span class="store-discord-icon" aria-hidden="true"><svg width="26" height="26" viewBox="0 0 24 24" fill="currentColor"><path d="M20.3 4.4A19.6 19.6 0 0 0 15.4 3l-.6 1.3a18.2 18.2 0 0 0-5.6 0L8.6 3a19.6 19.6 0 0 0-4.9 1.5C.6 9.1-.3 13.6.2 18.1a19.8 19.8 0 0 0 6 3l1.3-2.1a12.8 12.8 0 0 1-2-1l.5-.4a14.1 14.1 0 0 0 12 0l.5.4c-.6.4-1.3.7-2 1l1.3 2.1a19.7 19.7 0 0 0 6-3c.6-5.2-.9-9.7-3.5-13.7zM8.1 15.3c-1.2 0-2.2-1.1-2.2-2.4s1-2.4 2.2-2.4 2.2 1.1 2.2 2.4-1 2.4-2.2 2.4zm7.8 0c-1.2 0-2.2-1.1-2.2-2.4s1-2.4 2.2-2.4 2.2 1.1 2.2 2.4-1 2.4-2.2 2.4z"/></svg></span>
+    <span class="store-discord-text"><strong>Join the Velo Discord &middot; free Velo Neon cloak</strong><span>Giveaways, sales first, the VIP role and help. Link your Minecraft account there and the cloak is yours.</span></span>
+    <span class="btn store-discord-btn">Join the Discord</span>
+  </a>
+
+  <nav class="store-tabs" aria-label="Store sections" id="store-tabs">
+    <a href="#featured">Featured</a><a href="#daily">Daily picks</a><a href="#wings">Wings</a><a href="#capes">Cloaks</a><a href="#auras">Auras</a><a href="#emotes">Emotes</a><a href="#killfx">Kill FX</a><a href="#wear">Bodywear</a><a href="#pets">Pets</a><a href="#bundles">Bundles</a><a href="#coins">Velo Coins</a><a href="#plus">Velo+</a>
+  </nav>
+
+  <section class="store-section" id="featured" aria-label="Featured collection"><div class="skeleton" style="height:340px"></div></section>
+  <section class="store-section" id="daily" aria-labelledby="daily-h">
+    <div class="store-section-head"><h2 id="daily-h">Daily picks</h2><span data-daily-ends></span></div>
+    <div class="items" data-grid="daily"><div class="skeleton" style="height:280px"></div><div class="skeleton" style="height:280px"></div><div class="skeleton" style="height:280px"></div><div class="skeleton" style="height:280px"></div></div>
+  </section>
+
+  <div class="toolbar reveal" id="tools">
+    <label class="sr-only" for="store-search">Search the Store</label>
+    <input id="store-search" type="search" placeholder="Search wings, cloaks, pets, auras, emotes…" autocomplete="off">
+    <label class="sr-only" for="store-sort">Sort</label>
+    <select id="store-sort"><option value="featured">Featured first</option><option value="low">Price: low to high</option><option value="high">Price: high to low</option><option value="name">Name</option></select>
+    <label class="sr-only" for="store-owned">Show</label>
+    <select id="store-owned"><option value="all">All items</option><option value="unowned">Not owned yet</option><option value="owned">Owned</option></select>
+  </div>
+
+  <section class="store-section" id="wings" aria-labelledby="wings-h">
+    <div class="store-section-head"><h2 id="wings-h">Wings</h2><span>Real 3D wings that flap with you - and come alive: flames lick, tentacles writhe, blades fan, gears turn, metal shines. Neon recolours to any shade.</span></div>
+    <div class="items" data-grid="wings"></div>
+  </section>
+  <section class="store-section" id="capes" aria-labelledby="capes-h">
+    <div class="store-section-head"><h2 id="capes-h">Animated cloaks</h2><span>Drag a cloak to turn it. The Velo Neon cloak is free when you link Discord.</span></div>
+    <div class="items" data-grid="cape"></div>
+  </section>
+  <section class="store-section" id="auras" aria-labelledby="auras-h">
+    <div class="store-section-head"><h2 id="auras-h">Auras</h2><span>Particles around you, in the colour, size and speed you choose.</span></div>
+    <div class="items" data-grid="aura"></div>
+  </section>
+  <section class="store-section" id="emotes" aria-labelledby="emotes-h">
+    <div class="store-section-head"><h2 id="emotes-h">Emotes <span class="pill">New</span></h2><span>Wave, cheer, bow, backflip and more - each with its own effects and sounds. Hold B in game for your emote wheel.</span></div>
+    <div class="items" data-grid="emote"></div>
+  </section>
+  <section class="store-section" id="killfx" aria-labelledby="killfx-h">
+    <div class="store-section-head"><h2 id="killfx-h">Kill effects <span class="pill">New</span></h2><span>Custom particles and sounds where your kills fall - shatter, orbital strike, black hole, phoenix and more, in your colour.</span></div>
+    <div class="items" data-grid="killfx"></div>
+  </section>
+  <section class="store-section" id="wear" aria-labelledby="wear-h">
+    <div class="store-section-head"><h2 id="wear-h">Bodywear <span class="pill">New</span></h2><span>Hats, ears, glasses, gold chains, scarves, watches, shoes and backpacks - one per slot, all worn at once, most of them in any colour you pick.</span></div>
+    <div class="items" data-grid="wear"></div>
+  </section>
+  <section class="store-section" id="pets" aria-labelledby="pets-h" hidden>
+    <div class="store-section-head"><h2 id="pets-h">Pets <span class="pill">New</span></h2><span>A companion that follows you, does tricks, naps on your shoulder - and grows big enough to ride. Hover one to see it move.</span></div>
+    <div class="items" data-grid="pet"></div>
+  </section>
+  <section class="store-section" id="bundles" aria-labelledby="bundles-h">
+    <div class="store-section-head"><h2 id="bundles-h">Bundles</h2><span>Several items for one price. Items you own already are taken off.</span></div>
+    <div class="bundles" data-grid="bundles"></div>
+  </section>
+
+  <section class="store-section" id="coins" aria-labelledby="coins-h">
+    <div class="store-section-head"><h2 id="coins-h">Velo Coins</h2><a href="#free">Get coins for free</a></div>
+    <div class="launch-gift" data-launch-gift><i class="coin-dot"></i><div><strong>Launch week gift: {{launch.bonusCoins}} Velo Coins free</strong><span>Sign in to Velo for the first time during launch week ({{launch.bonusWeek}}) and the coins are on your account right away - no purchase needed.</span></div></div>
+    <div class="code-box" data-code-box hidden></div>
+    <div class="packs" data-grid="packs"></div>
+    <p class="mono" style="margin-top:14px" data-checkout-note>Secure checkout by Tebex. Coins land on your account right after payment.</p>
+  </section>
+
+  <section class="store-section" id="plus" aria-labelledby="plus-store-h">
+    <div class="plus-card reveal">
+      <div class="plus-top">
+        <div>
+          <span class="plus-badge">VELO+</span>
+          <h2 id="plus-store-h">World Hosting, Cloud Sync, Clips Pro, Name Styles, your own Home background and {{plus.monthlyCoins}} coins a month.</h2>
+          <p>Plus animated custom cloaks, the + badge and the VIP role on Discord. Try it free for 7 days (once per account), then billed monthly - cancel any time. <a href="/features#plus">What's included</a></p>
+        </div>
+        <div style="display:grid;gap:10px;justify-items:start">
+          <span class="price" data-plus-price>{{plus.price}}<small> / month</small></span>
+          <button class="btn btn-primary btn-lg magnetic" type="button" data-plus-buy>Get Velo+</button>
+          <button class="btn btn-lg" type="button" data-plus-yearly hidden>Yearly</button>
+          <span style="font-size:13.5px;color:var(--text-2)" data-plus-state></span>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section class="store-section" id="free" aria-labelledby="free-h">
+    <div class="store-section-head"><h2 id="free-h">Coins without paying</h2></div>
+    <div class="free-ways">
+      <div class="card spot reveal" style="--i:0"><span class="ico"><svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 6h16v14H4zM4 10h16M9 3v4M15 3v4"/></svg></span><h3>Daily rewards</h3><p style="margin:0;color:var(--text-2)">Log in and play each day; streaks pay more.</p></div>
+      <div class="card spot reveal" style="--i:1"><span class="ico"><svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 11l3 3 8-8M20 12v7a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h9"/></svg></span><h3>Quests</h3><p style="margin:0;color:var(--text-2)">Mine, build, fight and explore: daily quests pay coins.</p></div>
+      <div class="card spot reveal" style="--i:2"><span class="ico"><svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="9" cy="8" r="3.5"/><path d="M2.5 20c0-3.6 2.9-6 6.5-6s6.5 2.4 6.5 6M19 8v6M16 11h6"/></svg></span><h3>Invite friends</h3><p style="margin:0;color:var(--text-2)">Share your code from the launcher; you both get coins once they've played.</p></div>
+    </div>
+  </section>
+  <noscript><p class="notice">The Store needs JavaScript. You can also buy everything in the Velo launcher.</p></noscript>
+</div>
+<div id="toasts" role="status" aria-live="polite"></div>
+<script type="module" src="{{asset.skin3d}}"></script>
+<script src="{{asset.store}}" defer></script>

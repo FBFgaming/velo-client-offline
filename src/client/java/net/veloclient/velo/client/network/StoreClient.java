@@ -1,0 +1,711 @@
+package net.veloclient.velo.client.network;
+
+import com.google.gson.JsonArray;
+import com.google.gson.JsonObject;
+import com.google.gson.JsonParser;
+import net.minecraft.client.MinecraftClient;
+
+import java.net.URI;
+import java.net.http.HttpRequest;
+import java.net.http.HttpResponse;
+import java.time.Duration;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Set;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.Executors;
+import java.util.function.Consumer;
+
+/**
+ * The game's view of the Velo Coins economy, which lives on the Velo server (balances, owned
+ * cosmetics, coin packs, daily rewards). Everything here is a cache of the server's answer -
+ * nothing stored on this computer can create coins or items. Calls run off the render thread and
+ * report back on the client thread.
+ */
+public final class StoreClient {
+
+	/** Several items for one price (the server's offer); owning some lowers the price, the server works that out. */
+	public record Bundle(String id, String name, String description, List<String> items, int price) {
+	}
+
+	public record CoinPack(String id, int coins, int bonus, double price) {
+		public int total() {
+			return coins + bonus;
+		}
+	}
+
+	public record Quest(String id, String title, long progress, long target, int coins, boolean claimed, boolean claimable, String hint) {
+	}
+
+	public record Rewards(int onlineMinutes, boolean loginClaimed, boolean loginClaimable, int loginCoins, int streak,
+			List<Quest> quests, int adsWatched, int adsPerDay, int adCoins, boolean adsEnabled, long resetsInSeconds,
+			int weeklyBonus, boolean weeklyBonusToday) {
+	}
+
+	private static volatile int balance = -1;
+	private static volatile Set<String> owned = Set.of();
+	/** Whether the server has told us what we own yet (this session). */
+	private static volatile boolean walletLoaded;
+	private static volatile boolean owner;
+	private static volatile boolean plus;
+	private static volatile long plusUntil;
+	private static volatile boolean welcomeGift;
+	private static volatile long welcomeGiftUntil;
+	private static volatile double plusPrice = 9.99;
+	private static volatile int plusMonthlyCoins = 2000;
+	private static volatile boolean plusTrialAvailable;
+	private static volatile int plusTrialDays = 7;
+	private static volatile double plusYearlyPrice;
+	private static volatile String currency = "EUR";
+	private static volatile List<CoinPack> packs = List.of();
+	private static volatile boolean checkoutEnabled;
+	private static volatile Rewards rewards;
+	private static volatile long lastWalletRefresh;
+	private static volatile String lastError;
+
+	private StoreClient() {
+	}
+
+	/** Last known balance, or -1 while unknown (not connected yet). */
+	public static int balance() {
+		return balance;
+	}
+
+	public static boolean owns(String itemId) {
+		return owned.contains(itemId);
+	}
+
+	public static Set<String> owned() {
+		return owned;
+	}
+
+	/** True once the wallet (owned items) has been loaded from the server. */
+	public static boolean walletLoaded() {
+		return walletLoaded;
+	}
+
+	public static boolean isOwner() {
+		return owner;
+	}
+
+	/** Whether you're a Velo+ member (Cloud Sync, Clips Pro, Name Styles, animated custom capes, monthly coins, the badge with the plus). */
+	public static boolean plus() {
+		return plus;
+	}
+
+	/** What Velo+ costs per month (in the store's currency) and the Velo Coins it includes every month. */
+	public static double plusPrice() {
+		return plusPrice;
+	}
+
+	/** Whether this account can still start the free Velo+ trial (it never had Velo+). */
+	public static boolean plusTrialAvailable() {
+		return plusTrialAvailable;
+	}
+
+	/** The yearly Velo+ price (0 = no yearly plan). */
+	public static double plusYearlyPrice() {
+		return plusYearlyPrice;
+	}
+
+	public static int plusTrialDays() {
+		return plusTrialDays;
+	}
+
+	public static int plusMonthlyCoins() {
+		return plusMonthlyCoins;
+	}
+
+	/** When your Velo+ ends (epoch millis), 0 if you're not a member. */
+	/** The 1.0 welcome gift: this account may still pick one Store cosmetic for free. */
+	public static boolean welcomeGift() {
+		return welcomeGift;
+	}
+
+	public static long welcomeGiftUntil() {
+		return welcomeGiftUntil;
+	}
+
+	public static long plusUntil() {
+		return plusUntil;
+	}
+
+	public static List<CoinPack> packs() {
+		return packs;
+	}
+
+	public static String currency() {
+		return currency;
+	}
+
+	public static boolean checkoutEnabled() {
+		return checkoutEnabled;
+	}
+
+	public static Rewards rewards() {
+		return rewards;
+	}
+
+	/** Why the last refresh failed (shown instead of an endless "Loading..."), or null. */
+	public static String lastError() {
+		return lastError;
+	}
+
+	public static boolean connected() {
+		return VeloServerClient.sessionToken() != null && VeloServerClient.serverBaseUrl() != null;
+	}
+
+	private static volatile boolean demo;
+
+	/** Dev-only (screenshot tour): sample numbers so the screen can be checked without a server. */
+	public static void loadDemo() {
+		demo = true;
+		balance = 1340;
+		currency = "EUR";
+		checkoutEnabled = true;
+		packs = List.of(new CoinPack("coins_1200", 1200, 0, 4.99), new CoinPack("coins_2500", 2300, 200, 9.99),
+				new CoinPack("coins_5500", 4700, 800, 19.99), new CoinPack("coins_15000", 12000, 3000, 49.99));
+		rewards = new Rewards(42, false, true, 12, 3, List.of(
+				new Quest("kill_100", "Defeat 100 mobs", 64, 100, 10, false, false, null),
+				new Quest("play_60", "Play for 1 hour", 60, 60, 8, false, true, null),
+				new Quest("walk_5k", "Travel 5 km", 5000, 5000, 8, true, false, null)), 1, 3, 6, false, 5 * 3600 + 720, 40, false);
+		owner = true;
+	}
+
+	// ---- Refresh ----
+
+	/** Refreshes wallet + catalog + rewards (at most every few seconds unless {@code force}). */
+	public static void refresh(boolean force, Runnable onDone) {
+		if (demo) {
+			if (onDone != null) {
+				onDone.run();
+			}
+			return;
+		}
+		long now = System.currentTimeMillis();
+		if (!force && now - lastWalletRefresh < 5_000) {
+			if (onDone != null) {
+				onDone.run();
+			}
+			return;
+		}
+		lastWalletRefresh = now;
+		Set<String> ownedBefore = owned;
+		async(() -> {
+			// The catalog is public; wallet and rewards need the Velo session.
+			applyCatalog(get("/v1/store/catalog"));
+			if (VeloServerClient.sessionToken() == null) {
+				throw new java.io.IOException("Not connected");
+			}
+			applyWallet(get("/v1/store/wallet"));
+			try {
+				JsonObject status = get("/v1/plus/status");
+				plusPrice = status.get("price").getAsDouble();
+				plusMonthlyCoins = status.get("monthlyCoins").getAsInt();
+				plusTrialAvailable = status.has("trialAvailable") && status.get("trialAvailable").getAsBoolean();
+				plusTrialDays = status.has("trialDays") ? status.get("trialDays").getAsInt() : 7;
+				plusYearlyPrice = status.has("yearlyPrice") ? status.get("yearlyPrice").getAsDouble() : 0;
+			} catch (Exception ignored) {
+				// An older server: the defaults stay.
+			}
+			applyRewards(get("/v1/rewards"));
+			return null;
+		}, ok -> {
+			lastError = null;
+			// The catalog lists what you own too, so it follows the wallet.
+			net.veloclient.velo.client.cosmetics.CosmeticsCatalog.refresh(!owned.equals(ownedBefore));
+			net.veloclient.velo.client.store.StoreRestore.restoreMissing();
+			if (onDone != null) {
+				onDone.run();
+			}
+		}, error -> {
+			lastError = error;
+			if (onDone != null) {
+				onDone.run();
+			}
+		});
+	}
+
+	// ---- Actions (results on the client thread; errors carry the server's message) ----
+
+	public static void buy(String itemId, Runnable onOk, Consumer<String> onError) {
+		JsonObject body = new JsonObject();
+		body.addProperty("itemId", itemId);
+		async(() -> post("/v1/store/buy", body), wallet -> {
+			applyWallet(wallet);
+			onOk.run();
+		}, onError);
+	}
+
+	/** A single item's action: the free welcome gift while it's available, otherwise a normal coin purchase. */
+	public static void buyOrClaim(String itemId, Runnable onOk, Consumer<String> onError) {
+		if (welcomeGift) {
+			claimWelcomeGift(itemId, onOk, onError);
+		} else {
+			buy(itemId, onOk, onError);
+		}
+	}
+
+	/** The label for a single item's buy button (the welcome gift makes it free). */
+	public static String buyLabel(int price) {
+		return welcomeGift ? "Claim free - welcome gift" : String.format(java.util.Locale.ROOT, "Buy for %,d Velo Coins", price);
+	}
+
+	/** Takes {@code itemId} as this account's free welcome gift (once). */
+	public static void claimWelcomeGift(String itemId, Runnable onOk, Consumer<String> onError) {
+		JsonObject body = new JsonObject();
+		body.addProperty("itemId", itemId);
+		async(() -> post("/v1/store/welcome-gift", body), wallet -> {
+			applyWallet(wallet);
+			onOk.run();
+		}, onError);
+	}
+
+	/** Starts a coin-pack checkout; {@code onUrl} gets the Tebex payment page + order id. */
+	public static void checkout(String packId, java.util.function.BiConsumer<String, String> onUrl, Consumer<String> onError) {
+		JsonObject body = new JsonObject();
+		body.addProperty("packId", packId);
+		async(() -> post("/v1/store/checkout", body),
+				result -> onUrl.accept(result.get("checkoutUrl").getAsString(), result.get("orderId").getAsString()), onError);
+	}
+
+	/** Order status: pending / paid / review / refunded ... */
+	public static void orderStatus(String orderId, Consumer<String> onStatus) {
+		async(() -> get("/v1/store/order?id=" + java.net.URLEncoder.encode(orderId, java.nio.charset.StandardCharsets.UTF_8)), result -> {
+			balance = result.get("balance").getAsInt();
+			onStatus.accept(result.get("status").getAsString());
+		}, error -> { });
+	}
+
+	public static void claimLogin(Runnable onOk, Consumer<String> onError) {
+		async(() -> post("/v1/rewards/login", new JsonObject()), r -> {
+			applyRewards(r);
+			refresh(true, null);
+			onOk.run();
+		}, onError);
+	}
+
+	public static void claimQuest(String questId, Runnable onOk, Consumer<String> onError) {
+		JsonObject body = new JsonObject();
+		body.addProperty("questId", questId);
+		async(() -> post("/v1/rewards/quest", body), r -> {
+			applyRewards(r);
+			refresh(true, null);
+			onOk.run();
+		}, onError);
+	}
+
+	/** Opens the rewarded-ad page; {@code onUrl} receives its address. */
+	public static void startAd(Consumer<String> onUrl, Consumer<String> onError) {
+		async(() -> post("/v1/rewards/ad", new JsonObject()), r -> onUrl.accept(r.get("url").getAsString()), onError);
+	}
+
+	/** Server-tracked game statistics increases for today's quests (see RewardsReporter). */
+	public static void reportProgress(JsonObject stats) {
+		JsonObject body = new JsonObject();
+		body.add("stats", stats);
+		async(() -> post("/v1/rewards/progress", body), r -> { }, e -> { });
+	}
+
+	// ---- Owner tools ----
+
+	public static void adminCoins(String target, int amount, String note, Consumer<JsonObject> onOk, Consumer<String> onError) {
+		JsonObject body = new JsonObject();
+		body.addProperty("target", target);
+		body.addProperty("amount", amount);
+		body.addProperty("note", note);
+		async(() -> post("/v1/admin/store/coins", body), onOk, onError);
+	}
+
+	/** Owner: everything about a player - {@code username}, {@code uuid}, {@code balance}, {@code owned}, {@code plusUntil}, {@code ledger}. */
+	public static void adminLookup(String target, Consumer<JsonObject> onOk, Consumer<String> onError) {
+		JsonObject body = new JsonObject();
+		body.addProperty("target", target);
+		async(() -> post("/v1/admin/store/lookup", body), onOk, onError);
+	}
+
+	/** Owner: gives {@code days} of Velo+ (more than 0) or ends it (0). */
+	public static void adminPlus(String target, int days, Consumer<JsonObject> onOk, Consumer<String> onError) {
+		JsonObject body = new JsonObject();
+		body.addProperty("target", target);
+		body.addProperty("days", days);
+		async(() -> post("/v1/admin/store/plus", body), onOk, onError);
+	}
+
+	/** Starts the free Velo+ trial; {@code onOk} runs once it's on (the store refreshes). */
+	public static void plusTrial(Runnable onOk, Consumer<String> onError) {
+		async(() -> post("/v1/plus/trial", new JsonObject()), r -> {
+			plusTrialAvailable = false;
+			refresh(true, onOk);
+		}, onError);
+	}
+
+	/** Starts the Velo+ subscription checkout; {@code onUrl} gets the payment page. */
+	public static void plusCheckout(Consumer<String> onUrl, Consumer<String> onError) {
+		plusCheckout(false, onUrl, onError);
+	}
+
+	/** Like {@link #plusCheckout(Consumer, Consumer)}, for the yearly plan when {@code yearly}. */
+	public static void plusCheckout(boolean yearly, Consumer<String> onUrl, Consumer<String> onError) {
+		JsonObject body = new JsonObject();
+		if (yearly) {
+			body.addProperty("period", "year");
+		}
+		async(() -> post("/v1/plus/checkout", body), r -> onUrl.accept(r.get("checkoutUrl").getAsString()), onError);
+	}
+
+	/** A code to type as {@code /link <code>} in the Velo Discord (unlocks the Velo Neon cape). */
+	public static void discordCode(Consumer<JsonObject> onOk, Consumer<String> onError) {
+		async(() -> post("/v1/discord/code", new JsonObject()), onOk, onError);
+	}
+
+	/** Gives a player every cosmetic that isn't hidden (testing ones too) - for testing. */
+	public static void adminGrantAll(String target, Consumer<JsonObject> onOk, Consumer<String> onError) {
+		JsonObject body = new JsonObject();
+		body.addProperty("target", target);
+		async(() -> post("/v1/admin/store/grant-all", body), onOk, onError);
+	}
+
+	/** Gives ({@code grant}) or takes away a cosmetic (any status - testing items too). */
+	public static void adminItem(String target, String itemId, boolean grant, Consumer<JsonObject> onOk, Consumer<String> onError) {
+		JsonObject body = new JsonObject();
+		body.addProperty("target", target);
+		body.addProperty("itemId", itemId);
+		body.addProperty("grant", grant);
+		async(() -> post("/v1/admin/store/item", body), onOk, onError);
+	}
+
+	/** Every cosmetic with its status, collections and the featured one (owner only). */
+	public static void adminCosmetics(Consumer<JsonObject> onOk, Consumer<String> onError) {
+		if (demo) {
+			onOk.accept(demoAdmin());
+			return;
+		}
+		async(() -> get("/v1/admin/cosmetics"), onOk, onError);
+	}
+
+	/** Screenshot tour: the bundled catalog as the owner panel's data, with mixed statuses and one bundle. */
+	private static JsonObject demoAdmin() {
+		JsonObject data = new JsonObject();
+		com.google.gson.JsonArray items = new com.google.gson.JsonArray();
+		String[] statuses = {"released", "released", "testing", "hidden"};
+		int n = 0;
+		for (var wing : net.veloclient.velo.client.cosmetics.wings.WingsManager.catalog()) {
+			JsonObject item = new JsonObject();
+			item.addProperty("id", wing.itemId());
+			item.addProperty("name", wing.name());
+			item.addProperty("price", wing.price());
+			item.addProperty("status", statuses[n++ % statuses.length]);
+			item.addProperty("collection", wing.collection() == null ? "" : wing.collection());
+			items.add(item);
+		}
+		for (var aura : net.veloclient.velo.client.cosmetics.aura.AuraManager.catalog()) {
+			JsonObject item = new JsonObject();
+			item.addProperty("id", aura.itemId());
+			item.addProperty("name", aura.name());
+			item.addProperty("price", aura.price());
+			item.addProperty("status", statuses[n++ % statuses.length]);
+			items.add(item);
+		}
+		data.add("items", items);
+		com.google.gson.JsonArray collections = new com.google.gson.JsonArray();
+		for (var c : net.veloclient.velo.client.cosmetics.wings.WingsManager.collections()) {
+			JsonObject collection = new JsonObject();
+			collection.addProperty("id", c.id());
+			collection.addProperty("name", c.name());
+			collection.addProperty("tag", c.tag());
+			collection.addProperty("description", c.description());
+			collections.add(collection);
+		}
+		data.add("collections", collections);
+		com.google.gson.JsonArray bundles = new com.google.gson.JsonArray();
+		JsonObject bundle = new JsonObject();
+		bundle.addProperty("id", "starter");
+		bundle.addProperty("name", "Starter Pack");
+		bundle.addProperty("description", "Three favourites for less");
+		com.google.gson.JsonArray bundleItems = new com.google.gson.JsonArray();
+		for (int i = 0; i < Math.min(3, items.size()); i++) {
+			bundleItems.add(items.get(i).getAsJsonObject().get("id").getAsString());
+		}
+		bundle.add("items", bundleItems);
+		bundle.addProperty("price", 3900);
+		bundle.addProperty("active", true);
+		bundles.add(bundle);
+		data.add("bundles", bundles);
+		data.addProperty("featured", collections.isEmpty() ? "" : collections.get(0).getAsJsonObject().get("id").getAsString());
+		return data;
+	}
+
+	/** Changes a cosmetic: only the fields in {@code item} (plus its id) change. */
+	public static void adminUpdateCosmetic(JsonObject item, boolean clearWindow, Consumer<JsonObject> onOk, Consumer<String> onError) {
+		JsonObject body = new JsonObject();
+		body.add("item", item);
+		body.addProperty("clearWindow", clearWindow);
+		async(() -> post("/v1/admin/cosmetics/item", body), r -> {
+			net.veloclient.velo.client.cosmetics.CosmeticsCatalog.refresh(true);
+			onOk.accept(r);
+		}, onError);
+	}
+
+	/** Creates or changes a collection (id, name, tag, description). Owner only. */
+	public static void adminCollection(JsonObject collection, Consumer<JsonObject> onOk, Consumer<String> onError) {
+		async(() -> post("/v1/admin/cosmetics/collection", collection), onOk, onError);
+	}
+
+	/** Creates or changes an owner bundle (id, name, description, items, price, active, availableUntil). Owner only. */
+	public static void adminBundle(JsonObject bundle, Consumer<JsonObject> onOk, Consumer<String> onError) {
+		async(() -> post("/v1/admin/cosmetics/bundle", bundle), onOk, onError);
+	}
+
+	public static void adminDeleteBundle(String id, Consumer<JsonObject> onOk, Consumer<String> onError) {
+		JsonObject body = new JsonObject();
+		body.addProperty("id", id);
+		async(() -> post("/v1/admin/cosmetics/bundle/delete", body), onOk, onError);
+	}
+
+	/** Which collection the store features (blank = the newest). Owner only. */
+	public static void adminFeatured(String collectionId, Consumer<JsonObject> onOk, Consumer<String> onError) {
+		JsonObject body = new JsonObject();
+		body.addProperty("collection", collectionId);
+		async(() -> post("/v1/admin/cosmetics/featured", body), onOk, onError);
+	}
+
+	/** Player chat reports ({@code status} "open" or "all"). Staff only. */
+	public static void staffReports(String status, Consumer<JsonObject> onOk, Consumer<String> onError) {
+		if (demo) {
+			JsonObject result = new JsonObject();
+			com.google.gson.JsonArray reports = new com.google.gson.JsonArray();
+			JsonObject report = com.google.gson.JsonParser.parseString("{\"id\":\"r1\",\"category\":\"harassment\",\"reporterName\":\"jeb_\","
+					+ "\"targetName\":\"Griefer42\",\"context\":\"dm\",\"status\":\"open\",\"reason\":\"Keeps spamming me\",\"at\":"
+					+ (System.currentTimeMillis() - 3_600_000L) + ",\"messages\":[{\"fromName\":\"Griefer42\",\"text\":\"give me your base coords\"},"
+					+ "{\"fromName\":\"jeb_\",\"text\":\"no, stop\"}]}").getAsJsonObject();
+			reports.add(report);
+			result.add("reports", reports);
+			onOk.accept(result);
+			return;
+		}
+		async(() -> get("/v1/staff/reports?status=" + status), onOk, onError);
+	}
+
+	/** Closes a report, optionally banning the reported player from friends and parties for {@code days} (0 = for good). */
+	public static void staffResolve(String id, boolean ban, int days, Consumer<JsonObject> onOk, Consumer<String> onError) {
+		JsonObject body = new JsonObject();
+		body.addProperty("id", id);
+		body.addProperty("status", ban ? "actioned" : "dismissed");
+		if (ban) {
+			JsonObject b = new JsonObject();
+			com.google.gson.JsonArray services = new com.google.gson.JsonArray();
+			services.add("friends");
+			services.add("parties");
+			b.add("services", services);
+			b.addProperty("days", days);
+			b.addProperty("reason", "Reported chat");
+			body.add("ban", b);
+		}
+		async(() -> post("/v1/staff/reports/resolve", body), onOk, onError);
+	}
+
+	// ---- Parsing ----
+
+	private static boolean proofFetched;
+
+	private static void applyWallet(JsonObject wallet) {
+		balance = wallet.get("balance").getAsInt();
+		owner = wallet.has("owner") && wallet.get("owner").getAsBoolean();
+		boolean wasPlus = plus;
+		plus = wallet.has("plus") && wallet.get("plus").getAsBoolean();
+		plusUntil = wallet.has("plusUntil") ? wallet.get("plusUntil").getAsLong() : 0;
+		welcomeGift = wallet.has("welcomeGift") && wallet.get("welcomeGift").getAsBoolean();
+		welcomeGiftUntil = wallet.has("welcomeGiftUntil") ? wallet.get("welcomeGiftUntil").getAsLong() : 0;
+		if (plus && !wasPlus || !proofFetched) {
+			// Once per start, and again when you just became a member: the signed proof the offline checks use.
+			proofFetched = true;
+			net.veloclient.velo.client.plus.PlusAccess.refresh();
+		}
+		java.util.Set<String> items = new java.util.HashSet<>();
+		for (var element : wallet.getAsJsonArray("owned")) {
+			items.add(element.getAsString());
+		}
+		owned = Set.copyOf(items);
+		walletLoaded = true;
+	}
+
+	private static volatile List<Bundle> bundles = List.of();
+	private static volatile List<String> dailyIds = List.of();
+	private static volatile long dailyEndsAt;
+	private static volatile java.util.Map<String, Integer> regularPrices = java.util.Map.of();
+
+	/** The bundles on offer (empty before the catalog loaded). */
+	public static List<Bundle> bundles() {
+		return bundles;
+	}
+
+	/** Today's picks as the server chose them (empty: pick locally, see the Store). */
+	public static List<String> dailyIds() {
+		return dailyIds;
+	}
+
+	/** When today's picks change (0 = unknown: midnight UTC). */
+	public static long dailyEndsAt() {
+		return dailyEndsAt;
+	}
+
+	/** The usual price of an item on a deal today, or null. */
+	public static Integer regularPrice(String itemId) {
+		return regularPrices.get(itemId);
+	}
+
+	/** Item prices from the server's catalog (the server is what actually charges). */
+	private static volatile java.util.Map<String, Integer> prices = java.util.Map.of();
+
+	/** The server's price for an item, or {@code fallback} before the catalog has loaded. */
+	public static int price(String itemId, int fallback) {
+		Integer price = prices.get(itemId);
+		return price != null ? price : fallback;
+	}
+
+	private static volatile boolean catalogLoaded;
+
+	/** Whether the server's catalog (prices, packs, bundles) has arrived this run - or demo data is in. */
+	public static boolean catalogLoaded() {
+		return catalogLoaded || demo;
+	}
+
+	private static void applyCatalog(JsonObject catalog) {
+		catalogLoaded = true;
+		if (catalog.has("items") && catalog.get("items").isJsonArray()) {
+			java.util.Map<String, Integer> map = new java.util.HashMap<>();
+			java.util.Map<String, Integer> regular = new java.util.HashMap<>();
+			for (var element : catalog.getAsJsonArray("items")) {
+				JsonObject item = element.getAsJsonObject();
+				if (item.has("id") && item.has("price")) {
+					map.put(item.get("id").getAsString(), item.get("price").getAsInt());
+					if (item.has("fullPrice") && !item.get("fullPrice").isJsonNull()) {
+						regular.put(item.get("id").getAsString(), item.get("fullPrice").getAsInt());
+					}
+				}
+			}
+			prices = java.util.Map.copyOf(map);
+			regularPrices = java.util.Map.copyOf(regular);
+		}
+		if (catalog.has("bundles") && catalog.get("bundles").isJsonArray()) {
+			List<Bundle> list = new ArrayList<>();
+			for (var element : catalog.getAsJsonArray("bundles")) {
+				JsonObject b = element.getAsJsonObject();
+				List<String> items = new ArrayList<>();
+				b.getAsJsonArray("items").forEach(e -> items.add(e.getAsString()));
+				String description = b.has("description") && !b.get("description").isJsonNull() ? b.get("description").getAsString() : "";
+				list.add(new Bundle(b.get("id").getAsString(), b.get("name").getAsString(), description, List.copyOf(items), b.get("price").getAsInt()));
+			}
+			bundles = List.copyOf(list);
+		}
+		if (catalog.has("daily") && catalog.get("daily").isJsonObject()) {
+			JsonObject daily = catalog.getAsJsonObject("daily");
+			List<String> ids = new ArrayList<>();
+			if (daily.has("items")) {
+				daily.getAsJsonArray("items").forEach(e -> ids.add(e.getAsString()));
+			}
+			dailyIds = List.copyOf(ids);
+			dailyEndsAt = daily.has("endsAt") ? daily.get("endsAt").getAsLong() : 0;
+		}
+		currency = catalog.get("currency").getAsString();
+		checkoutEnabled = catalog.get("checkoutEnabled").getAsBoolean();
+		List<CoinPack> list = new ArrayList<>();
+		for (var element : catalog.getAsJsonArray("coinPacks")) {
+			JsonObject p = element.getAsJsonObject();
+			list.add(new CoinPack(p.get("id").getAsString(), p.get("coins").getAsInt(), p.get("bonus").getAsInt(), p.get("price").getAsDouble()));
+		}
+		packs = List.copyOf(list);
+	}
+
+	private static void applyRewards(JsonObject r) {
+		List<Quest> quests = new ArrayList<>();
+		JsonArray array = r.getAsJsonArray("quests");
+		for (var element : array) {
+			JsonObject q = element.getAsJsonObject();
+			quests.add(new Quest(q.get("id").getAsString(), q.get("title").getAsString(), q.get("progress").getAsLong(),
+					q.get("target").getAsLong(), q.get("coins").getAsInt(), q.get("claimed").getAsBoolean(),
+					q.get("claimable").getAsBoolean(), q.has("hint") && !q.get("hint").isJsonNull() ? q.get("hint").getAsString() : null));
+		}
+		rewards = new Rewards(r.get("onlineMinutes").getAsInt(), r.get("loginClaimed").getAsBoolean(), r.get("loginClaimable").getAsBoolean(),
+				r.get("loginCoins").getAsInt(), r.get("streak").getAsInt(), List.copyOf(quests), r.get("adsWatched").getAsInt(),
+				r.get("adsPerDay").getAsInt(), r.get("adCoins").getAsInt(), r.get("adsEnabled").getAsBoolean(),
+				r.get("resetsInSeconds").getAsLong(), r.has("weeklyBonus") ? r.get("weeklyBonus").getAsInt() : 0,
+				r.has("weeklyBonusToday") && r.get("weeklyBonusToday").getAsBoolean());
+		if (r.has("balance")) {
+			balance = r.get("balance").getAsInt();
+		}
+	}
+
+	// ---- HTTP ----
+
+	@FunctionalInterface
+	private interface Call {
+		JsonObject run() throws Exception;
+	}
+
+	private static void async(Call call, Consumer<JsonObject> onOk, Consumer<String> onError) {
+		if (call == null) {
+			return;
+		}
+		CompletableFuture.supplyAsync(() -> {
+			try {
+				return (Object) call.run();
+			} catch (Exception e) {
+				return e;
+			}
+		}, Executors.newVirtualThreadPerTaskExecutor()).thenAccept(result -> MinecraftClient.getInstance().execute(() -> {
+			if (result instanceof Exception e) {
+				onError.accept(message(e));
+			} else {
+				onOk.accept((JsonObject) result);
+			}
+		}));
+	}
+
+	private static String message(Exception e) {
+		if (e instanceof VeloServerClient.HttpStatusException status) {
+			try {
+				JsonObject body = JsonParser.parseString(status.getMessage()).getAsJsonObject();
+				if (body.has("error")) {
+					return body.get("error").getAsString();
+				}
+			} catch (Exception ignored) {
+				// Not JSON.
+			}
+			return status.status >= 500 ? "The Velo server is unavailable right now" : "Request failed (HTTP " + status.status + ")";
+		}
+		return connected() ? "Couldn't reach the Velo server" : "Not connected to the Velo server yet";
+	}
+
+	private static JsonObject get(String path) throws Exception {
+		return send(builder(path).GET().build());
+	}
+
+	private static JsonObject post(String path, JsonObject body) throws Exception {
+		return send(builder(path).header("Content-Type", "application/json")
+				.POST(HttpRequest.BodyPublishers.ofString(body.toString())).build());
+	}
+
+	private static HttpRequest.Builder builder(String path) throws Exception {
+		String token = VeloServerClient.sessionToken();
+		String base = VeloServerClient.serverBaseUrl();
+		if (base == null) {
+			throw new java.io.IOException("Not connected");
+		}
+		HttpRequest.Builder builder = HttpRequest.newBuilder(URI.create(base + path)).header("Accept", "application/json")
+				.timeout(Duration.ofSeconds(20));
+		if (token != null) {
+			builder.header("Authorization", "Bearer " + token);
+		}
+		return builder;
+	}
+
+	private static JsonObject send(HttpRequest request) throws Exception {
+		HttpResponse<String> response = VeloServerClient.HTTP.send(request, HttpResponse.BodyHandlers.ofString());
+		if (response.statusCode() / 100 != 2) {
+			throw new VeloServerClient.HttpStatusException(response.statusCode(), response.body());
+		}
+		return JsonParser.parseString(response.body()).getAsJsonObject();
+	}
+}

@@ -1,0 +1,11 @@
+{
+	"providers": [
+		{
+			"type": "ttf",
+			"file": "velo-client:audiowide.ttf",
+			"size": 11,
+			"oversample": 12,
+			"shift": [0, 0]
+		}
+	]
+}

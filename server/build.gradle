@@ -1,0 +1,66 @@
+plugins {
+	id 'application'
+	id 'com.gradleup.shadow' version '8.3.5'
+}
+
+repositories {
+	mavenCentral()
+}
+
+java {
+	sourceCompatibility = JavaVersion.VERSION_21
+	targetCompatibility = JavaVersion.VERSION_21
+}
+
+application {
+	mainClass = 'net.veloclient.server.VeloServerApp'
+}
+
+dependencies {
+	// Same JSON library used everywhere else in this repo (launcher, mod).
+	implementation 'com.google.code.gson:gson:2.11.0'
+	// Store wallets, owned items, orders and the coin ledger live in one SQLite file in the data
+	// directory - real transactions (no half-applied purchases), nothing extra to install or run.
+	implementation 'org.xerial:sqlite-jdbc:3.46.1.3'
+
+	testImplementation platform('org.junit:junit-bom:5.10.2')
+	testImplementation 'org.junit.jupiter:junit-jupiter'
+	testRuntimeOnly 'org.junit.platform:junit-platform-launcher'
+}
+
+test {
+	useJUnitPlatform()
+}
+
+// The cosmetics the server knows from the start (server/cosmetics-seed/seed.json): server-only art
+// lives next to it, the art the mod bundles anyway is copied from the mod's resources.
+def cosmeticSeedRoot = layout.buildDirectory.dir("generated/cosmetic-seed")
+tasks.register("bundleCosmeticSeed", Copy) {
+	from(file("cosmetics-seed")) { into("cosmetics-seed") }
+	from(rootProject.file("src/client/resources/assets/velo-client/cosmetics/wings")) {
+		include("*.vmesh")
+		into("cosmetics-seed/client/wings")
+	}
+	from(rootProject.file("src/client/resources/assets/velo-client/textures/cosmetics/wings")) { into("cosmetics-seed/client/wings/textures") }
+	from(rootProject.file("src/client/resources/assets/velo-client/textures/store/cape")) { into("cosmetics-seed/client/capes") }
+	into(cosmeticSeedRoot)
+}
+sourceSets.main.resources.srcDir(cosmeticSeedRoot)
+tasks.named("processResources") { dependsOn("bundleCosmeticSeed") }
+
+// A single runnable jar with Gson bundled in, so deploying this is just
+// "copy one file, run `java -jar velo-server.jar`" - no classpath wrangling
+// needed on whatever box ends up hosting it (see server/README.md).
+tasks.named('shadowJar') {
+	archiveBaseName.set('velo-server')
+	archiveClassifier.set('')
+	archiveVersion.set('')
+	// sqlite-jdbc loads its native library; without this newer JDKs print warnings (and will block it).
+	manifest {
+		attributes('Enable-Native-Access': 'ALL-UNNAMED')
+	}
+}
+
+tasks.named('build') {
+	dependsOn tasks.named('shadowJar')
+}

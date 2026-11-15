@@ -1,0 +1,879 @@
+package net.veloclient.launcher.ui;
+
+import com.google.gson.JsonObject;
+import com.google.gson.JsonParser;
+import javafx.animation.AnimationTimer;
+import javafx.application.Platform;
+import javafx.geometry.Insets;
+import javafx.geometry.Pos;
+import javafx.scene.Node;
+import javafx.scene.control.Button;
+import javafx.scene.control.ComboBox;
+import javafx.scene.control.Label;
+import javafx.scene.control.ScrollPane;
+import javafx.scene.control.Slider;
+import javafx.scene.control.ToggleButton;
+import javafx.scene.control.ToggleGroup;
+import javafx.scene.image.Image;
+import javafx.scene.image.ImageView;
+import javafx.scene.input.Clipboard;
+import javafx.scene.input.ClipboardContent;
+import javafx.scene.input.KeyCode;
+import javafx.scene.layout.FlowPane;
+import javafx.scene.layout.HBox;
+import javafx.scene.layout.Priority;
+import javafx.scene.layout.Region;
+import javafx.scene.layout.StackPane;
+import javafx.scene.layout.VBox;
+import javafx.stage.FileChooser;
+import javafx.stage.Stage;
+import net.veloclient.launcher.LauncherLog;
+import net.veloclient.launcher.instance.Instance;
+import net.veloclient.launcher.instance.InstancePaths;
+import net.veloclient.launcher.instance.InstanceStore;
+import net.veloclient.launcher.media.MjpegAvi;
+
+import java.io.ByteArrayInputStream;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.StandardCopyOption;
+import java.time.Instant;
+import java.time.ZoneId;
+import java.time.format.DateTimeFormatter;
+import java.util.ArrayList;
+import java.util.Comparator;
+import java.util.List;
+import java.util.Locale;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.stream.Stream;
+
+/**
+ * Clips & Screenshots from every profile in one gallery: clips (saved in-game with the Clips
+ * module's key, or automatically after a fight) play right here with scrubbing, screenshots open
+ * full size. Export, copy, open folder and delete from the viewer.
+ */
+public final class MediaView {
+
+	private record Item(Path file, boolean clip, long modified, Path thumbnail, JsonObject meta, Instance profile) {
+	}
+
+	private static final DateTimeFormatter WHEN = DateTimeFormatter.ofPattern("d MMM yyyy, HH:mm", Locale.ENGLISH)
+			.withZone(ZoneId.systemDefault());
+	private static final ExecutorService LOADER = Executors.newFixedThreadPool(2, r -> {
+		Thread thread = new Thread(r, "velo-media");
+		thread.setDaemon(true);
+		return thread;
+	});
+
+	private final Stage owner;
+	private final StackPane root = new StackPane();
+	private final FlowPane grid = new FlowPane(14, 14);
+	private final ToggleButton clipsTab = new ToggleButton("Clips");
+	private final ToggleButton screenshotsTab = new ToggleButton("Screenshots");
+	private final ComboBox<String> profileFilter = new ComboBox<>();
+	private final Label hint = new Label();
+	private List<Item> items = List.of();
+	private Node gallery;
+	private AnimationTimer playback;
+	/** The open Clips Pro clip's player (null for other items). */
+	private ClipPlayerView proView;
+	/** The open clip and its playhead (frame index), for trimming. */
+	private MjpegAvi.Clip openClip;
+	private double[] playhead;
+	/** Trim range in frames while trimming ({@code [in, out]}), else null. */
+	private int[] trim;
+
+	private MediaView(Stage owner) {
+		this.owner = owner;
+		// Leaving the page (another sidebar entry) must not leave a clip playing in the background.
+		root.sceneProperty().addListener((o, a, scene) -> {
+			if (scene == null) {
+				stopPlayback();
+			}
+		});
+	}
+
+	public static Node build(Stage owner) {
+		return new MediaView(owner).buildGallery();
+	}
+
+	private Node buildGallery() {
+		Label title = new Label("Clips & Screenshots");
+		title.getStyleClass().add("page-title");
+		ToggleGroup group = new ToggleGroup();
+		clipsTab.setToggleGroup(group);
+		screenshotsTab.setToggleGroup(group);
+		clipsTab.setSelected(true);
+		clipsTab.getStyleClass().add("glass-button");
+		screenshotsTab.getStyleClass().add("glass-button");
+		group.selectedToggleProperty().addListener((o, a, b) -> {
+			if (b == null) {
+				a.setSelected(true);
+			} else {
+				render();
+			}
+		});
+		profileFilter.getItems().add("All profiles");
+		for (Instance instance : InstanceStore.loadAll()) {
+			profileFilter.getItems().add(instance.name());
+		}
+		profileFilter.setValue("All profiles");
+		profileFilter.valueProperty().addListener((o, a, b) -> render());
+		Button refresh = new Button("Refresh");
+		refresh.getStyleClass().add("glass-button");
+		refresh.setOnAction(e -> load());
+		Region spacer = new Region();
+		HBox.setHgrow(spacer, Priority.ALWAYS);
+		HBox top = new HBox(10, title, spacer, clipsTab, screenshotsTab, profileFilter, refresh);
+		top.setAlignment(Pos.CENTER_LEFT);
+		hint.getStyleClass().add("settings-row-hint");
+		hint.setWrapText(true);
+
+		grid.setPadding(new Insets(4, 4, 16, 4));
+		ScrollPane scroll = new ScrollPane(grid);
+		scroll.setFitToWidth(true);
+		scroll.getStyleClass().add("scroll-pane");
+		VBox.setVgrow(scroll, Priority.ALWAYS);
+		VBox box = new VBox(12, top, hint, scroll);
+		gallery = box;
+		root.getChildren().setAll(box);
+		load();
+		return root;
+	}
+
+	private void load() {
+		hint.setText("Loading...");
+		LOADER.execute(() -> {
+			List<Item> found = new ArrayList<>();
+			for (Instance instance : InstanceStore.loadAll()) {
+				Path game = InstancePaths.gameDir(instance.id());
+				found.addAll(scan(game.resolve("velo-clips"), true, instance));
+				found.addAll(scan(game.resolve("screenshots"), false, instance));
+			}
+			found.sort(Comparator.comparingLong(Item::modified).reversed());
+			Platform.runLater(() -> {
+				items = found;
+				render();
+			});
+		});
+	}
+
+	private static List<Item> scan(Path dir, boolean clip, Instance profile) {
+		if (!Files.isDirectory(dir)) {
+			return List.of();
+		}
+		try (Stream<Path> files = Files.list(dir)) {
+			return files.filter(p -> {
+				String n = p.getFileName().toString().toLowerCase(Locale.ROOT);
+				return clip ? n.endsWith(".avi") || n.endsWith(".mp4") && !n.endsWith(".tmp.mp4") : n.endsWith(".png") || n.endsWith(".jpg");
+			}).map(p -> {
+				long modified = 0;
+				try {
+					modified = Files.getLastModifiedTime(p).toMillis();
+				} catch (Exception ignored) {
+					// Unknown.
+				}
+				Path thumb = p;
+				JsonObject meta = null;
+				if (clip) {
+					String base = p.getFileName().toString().replaceFirst("\\.(avi|mp4)$", "");
+					thumb = p.resolveSibling(base + ".jpg");
+					try {
+						Path json = p.resolveSibling(base + ".json");
+						if (Files.exists(json)) {
+							meta = JsonParser.parseString(Files.readString(json, StandardCharsets.UTF_8)).getAsJsonObject();
+						}
+					} catch (Exception ignored) {
+						// No sidecar.
+					}
+				}
+				return new Item(p, clip, modified, thumb, meta, profile);
+			}).toList();
+		} catch (Exception e) {
+			return List.of();
+		}
+	}
+
+	private List<Item> shown() {
+		boolean clips = clipsTab.isSelected();
+		String profile = profileFilter.getValue();
+		return items.stream().filter(i -> i.clip() == clips)
+				.filter(i -> profile == null || profile.equals("All profiles") || i.profile().name().equals(profile)).toList();
+	}
+
+	private void render() {
+		List<Item> list = shown();
+		grid.getChildren().clear();
+		if (list.isEmpty()) {
+			hint.setText(clipsTab.isSelected()
+					? "No clips yet. Turn on the Clips module in-game (R-Shift > Quality of Life) and press F8 to save the last 30 seconds,"
+							+ " or let Fight Recap save your won fights automatically."
+					: "No screenshots yet - press F2 in-game.");
+			return;
+		}
+		hint.setText(list.size() + (clipsTab.isSelected() ? " clips" : " screenshots") + " - click one to open it.");
+		for (Item item : list) {
+			grid.getChildren().add(tile(item));
+		}
+	}
+
+	private Node tile(Item item) {
+		ImageView thumb = new ImageView();
+		thumb.setFitWidth(232);
+		thumb.setFitHeight(130);
+		thumb.setPreserveRatio(false);
+		thumb.setSmooth(true);
+		if (Files.exists(item.thumbnail())) {
+			thumb.setImage(new Image(item.thumbnail().toUri().toString(), 464, 260, true, true, true));
+		}
+		StackPane frame = new StackPane(thumb);
+		frame.setStyle("-fx-background-color: #0b0b0f; -fx-background-radius: 8;");
+		frame.setMinSize(232, 130);
+		frame.setMaxSize(232, 130);
+		javafx.scene.shape.Rectangle clip = new javafx.scene.shape.Rectangle(232, 130);
+		clip.setArcWidth(16);
+		clip.setArcHeight(16);
+		frame.setClip(clip);
+		if (item.clip()) {
+			Label play = new Label("▶");
+			play.setStyle("-fx-text-fill: white; -fx-font-size: 20; -fx-background-color: rgba(0,0,0,0.55); -fx-background-radius: 30;"
+					+ " -fx-padding: 6 12 6 14;");
+			Label length = new Label(item.meta() != null && item.meta().has("seconds")
+					? Math.round(item.meta().get("seconds").getAsDouble()) + "s" : "clip");
+			length.setStyle("-fx-text-fill: white; -fx-background-color: rgba(0,0,0,0.7); -fx-background-radius: 4; -fx-padding: 1 5;");
+			StackPane.setAlignment(length, Pos.BOTTOM_RIGHT);
+			StackPane.setMargin(length, new Insets(6));
+			frame.getChildren().addAll(play, length);
+		}
+		Label name = new Label(label(item));
+		name.getStyleClass().add("news-card-title");
+		name.setMaxWidth(232);
+		Label meta = new Label(WHEN.format(Instant.ofEpochMilli(item.modified())) + "  ·  " + item.profile().name());
+		meta.getStyleClass().add("news-card-date");
+		meta.setMaxWidth(232);
+		VBox card = new VBox(6, frame, name, meta);
+		card.getStyleClass().add("report-row");
+		card.setPadding(new Insets(8));
+		card.setOnMouseClicked(e -> openViewer(item));
+		card.setStyle("-fx-cursor: hand;");
+		return card;
+	}
+
+	private static String label(Item item) {
+		if (item.clip() && item.meta() != null && item.meta().has("recap")) {
+			JsonObject recap = item.meta().getAsJsonObject("recap");
+			String outcome = str(recap, "outcome");
+			return (outcome.equals("WON") ? "Won vs " : outcome.equals("LOST") ? "Lost vs " : "Fight vs ") + str(recap, "opponent");
+		}
+		if (item.clip() && item.meta() != null && item.meta().has("server")) {
+			return "Clip on " + item.meta().get("server").getAsString();
+		}
+		String name = item.file().getFileName().toString();
+		return name.substring(0, name.lastIndexOf('.'));
+	}
+
+	private static String str(JsonObject o, String key) {
+		return o.has(key) && !o.get(key).isJsonNull() ? o.get(key).getAsString() : "";
+	}
+
+	// ---- Viewer ----
+
+	/** The trim bar and its buttons for the open clip: {bar, set start, set end, trim}. */
+	private Object[] trimControls;
+
+	private void openViewer(Item item) {
+		stopPlayback();
+		if (item.clip() && item.file().getFileName().toString().endsWith(".mp4")) {
+			openProViewer(item);
+			return;
+		}
+		trim = null;
+		openClip = null;
+		trimControls = null;
+		List<Item> siblings = shown();
+		Button back = BackButton.create(null, null);
+		back.setOnAction(e -> closeViewer());
+		Label title = new Label(label(item));
+		title.getStyleClass().add("page-title");
+		Region spacer = new Region();
+		HBox.setHgrow(spacer, Priority.ALWAYS);
+		Button folder = new Button("Open folder");
+		folder.getStyleClass().add("glass-button");
+		folder.setOnAction(e -> openFolder(item.file().getParent()));
+		Button export = new Button(item.clip() ? "Export clip" : "Save as...");
+		export.getStyleClass().add("glass-button");
+		export.setOnAction(e -> export(item));
+		Button delete = new Button("Delete");
+		delete.getStyleClass().add("danger-ghost-button");
+		delete.setOnAction(e -> {
+			if (Confirm.ask(owner, "Delete " + (item.clip() ? "clip" : "screenshot") + "?", "This can't be undone.")) {
+				delete(item);
+				closeViewer();
+				load();
+			}
+		});
+		HBox top = new HBox(10, back, title, spacer, folder, export);
+		top.setAlignment(Pos.CENTER_LEFT);
+
+		ImageView view = new ImageView();
+		view.setPreserveRatio(true);
+		view.setSmooth(true);
+		StackPane stage = new StackPane(view);
+		stage.setStyle("-fx-background-color: #0b0b0f; -fx-background-radius: 10;");
+		stage.setMinSize(0, 0);
+		view.fitWidthProperty().bind(stage.widthProperty().subtract(8));
+		view.fitHeightProperty().bind(stage.heightProperty().subtract(8));
+		VBox.setVgrow(stage, Priority.ALWAYS);
+		HBox.setHgrow(stage, Priority.ALWAYS);
+
+		HBox controls = new HBox(10);
+		controls.setAlignment(Pos.CENTER_LEFT);
+		Node body = stage;
+		if (item.clip()) {
+			Label loading = new Label("Loading clip...");
+			loading.setStyle("-fx-text-fill: #9aa0b0;");
+			stage.getChildren().add(loading);
+			Button play = new Button("Pause");
+			play.getStyleClass().add("primary-button");
+			Slider seek = new Slider(0, 1, 0);
+			// The kept part while trimming, drawn behind the seek bar.
+			Region kept = new Region();
+			kept.setStyle("-fx-background-color: -velo-accent-soft; -fx-border-color: -velo-accent; -fx-border-width: 0 2 0 2;"
+					+ " -fx-background-radius: 4; -fx-border-radius: 4;");
+			kept.setManaged(false);
+			kept.setVisible(false);
+			javafx.scene.layout.Pane seekBox = new javafx.scene.layout.Pane(kept, seek);
+			seek.prefWidthProperty().bind(seekBox.widthProperty());
+			seekBox.setMinHeight(24);
+			seekBox.setPrefHeight(24);
+			HBox.setHgrow(seekBox, Priority.ALWAYS);
+			Label time = new Label("0.0s");
+			time.getStyleClass().add("settings-row-hint");
+			Button trimButton = new Button("Trim", Icons.icon("scissors", 14, javafx.scene.paint.Color.WHITE));
+			trimButton.getStyleClass().add("glass-button");
+			trimButton.setDisable(true);
+			controls.getChildren().addAll(play, seekBox, time, trimButton, delete);
+
+			Label range = new Label();
+			range.getStyleClass().add("t-mono");
+			Button setIn = new Button("Set start");
+			setIn.getStyleClass().add("ghost-button");
+			Button setOut = new Button("Set end");
+			setOut.getStyleClass().add("ghost-button");
+			Button saveCopy = new Button("Save as new clip");
+			saveCopy.getStyleClass().add("primary-button");
+			Button cancelTrim = new Button("Cancel");
+			cancelTrim.getStyleClass().add("ghost-button");
+			Label trimHint = new Label("Play or drag to a spot, then set start and end. Keys: I / O.");
+			trimHint.getStyleClass().add("t-muted");
+			Region trimGap = new Region();
+			HBox.setHgrow(trimGap, Priority.ALWAYS);
+			HBox trimBar = new HBox(10, Icons.icon("scissors", 16, javafx.scene.paint.Color.web("#E4E4E8")), setIn, setOut, range, trimHint, trimGap,
+					cancelTrim, saveCopy);
+			trimBar.setAlignment(Pos.CENTER_LEFT);
+			trimBar.getStyleClass().add("card");
+			trimBar.setPadding(new Insets(10, 14, 10, 14));
+			trimBar.setVisible(false);
+			trimBar.setManaged(false);
+			Runnable paintTrim = () -> {
+				if (trim == null || openClip == null) {
+					kept.setVisible(false);
+					return;
+				}
+				int last = Math.max(1, openClip.frames().size() - 1);
+				double w = seekBox.getWidth();
+				kept.setVisible(true);
+				kept.resizeRelocate(w * trim[0] / last, 2, Math.max(4, w * (trim[1] - trim[0]) / last), 20);
+				range.setText(String.format(Locale.ROOT, "%.1fs - %.1fs  (%.1fs)", trim[0] / openClip.fps(), trim[1] / openClip.fps(),
+						(trim[1] - trim[0] + 1) / openClip.fps()));
+			};
+			seekBox.widthProperty().addListener((o, a, b) -> paintTrim.run());
+			Runnable endTrim = () -> {
+				trim = null;
+				trimBar.setVisible(false);
+				trimBar.setManaged(false);
+				trimButton.setDisable(openClip == null);
+				paintTrim.run();
+			};
+			trimButton.setOnAction(e -> {
+				if (openClip == null) {
+					return;
+				}
+				trim = new int[] {0, openClip.frames().size() - 1};
+				trimBar.setVisible(true);
+				trimBar.setManaged(true);
+				trimButton.setDisable(true);
+				paintTrim.run();
+			});
+			setIn.setOnAction(e -> {
+				if (trim != null) {
+					trim[0] = Math.min((int) Math.round(playhead[0]), trim[1] - 1);
+					paintTrim.run();
+				}
+			});
+			setOut.setOnAction(e -> {
+				if (trim != null) {
+					trim[1] = Math.max((int) Math.round(playhead[0]), trim[0] + 1);
+					paintTrim.run();
+				}
+			});
+			cancelTrim.setOnAction(e -> endTrim.run());
+			saveCopy.setOnAction(e -> {
+				int[] keep = trim.clone();
+				MjpegAvi.Clip clip = openClip;
+				saveCopy.setDisable(true);
+				LOADER.execute(() -> {
+					try {
+						Path saved = saveTrimmed(item, clip, keep[0], keep[1]);
+						Platform.runLater(() -> {
+							saveCopy.setDisable(false);
+							endTrim.run();
+							Toasts.show(saveCopy, "Saved " + saved.getFileName());
+							load();
+						});
+					} catch (Exception ex) {
+						LauncherLog.warn("Couldn't save the trimmed clip", ex);
+						Platform.runLater(() -> {
+							saveCopy.setDisable(false);
+							Toasts.show(saveCopy, "Couldn't save: " + ex.getMessage());
+						});
+					}
+				});
+			});
+			trimControls = new Object[] {trimBar, setIn, setOut, trimButton};
+			LOADER.execute(() -> {
+				try {
+					MjpegAvi.Clip clip = MjpegAvi.read(item.file());
+					Platform.runLater(() -> {
+						stage.getChildren().remove(loading);
+						startPlayback(clip, view, play, seek, time, stage);
+						((Button) trimControls[3]).setDisable(false);
+					});
+				} catch (Exception ex) {
+					Platform.runLater(() -> loading.setText("Couldn't open this clip: " + ex.getMessage()));
+				}
+			});
+			if (item.meta() != null && item.meta().has("recap")) {
+				body = new HBox(14, stage, recapPanel(item.meta().getAsJsonObject("recap")));
+				VBox.setVgrow(body, Priority.ALWAYS);
+			}
+		} else {
+			view.setImage(new Image(item.file().toUri().toString(), true));
+			Button previous = new Button("← Previous");
+			previous.getStyleClass().add("glass-button");
+			Button next = new Button("Next →");
+			next.getStyleClass().add("glass-button");
+			int index = siblings.indexOf(item);
+			previous.setOnAction(e -> openViewer(siblings.get(Math.floorMod(index - 1, siblings.size()))));
+			next.setOnAction(e -> openViewer(siblings.get(Math.floorMod(index + 1, siblings.size()))));
+			Button copy = new Button("Copy image");
+			copy.getStyleClass().add("glass-button");
+			copy.setOnAction(e -> {
+				ClipboardContent content = new ClipboardContent();
+				content.putImage(new Image(item.file().toUri().toString()));
+				Clipboard.getSystemClipboard().setContent(content);
+				copy.setText("Copied");
+			});
+			Label counter = new Label((index + 1) + " / " + siblings.size() + "  ·  " + WHEN.format(Instant.ofEpochMilli(item.modified())));
+			counter.getStyleClass().add("settings-row-hint");
+			Region gap = new Region();
+			HBox.setHgrow(gap, Priority.ALWAYS);
+			controls.getChildren().addAll(previous, next, counter, gap, copy, delete);
+		}
+		VBox viewer = new VBox(12, top, body, controls);
+		if (item.clip() && trimControls != null) {
+			viewer.getChildren().add((Node) trimControls[0]);
+		}
+		viewer.setFocusTraversable(true);
+		viewer.setOnKeyPressed(e -> {
+			if (item.clip() && trim != null && (e.getCode() == KeyCode.I || e.getCode() == KeyCode.O)) {
+				((Button) trimControls[e.getCode() == KeyCode.I ? 1 : 2]).fire();
+			} else if (e.getCode() == KeyCode.ESCAPE) {
+				closeViewer();
+			} else if (!item.clip() && (e.getCode() == KeyCode.LEFT || e.getCode() == KeyCode.RIGHT)) {
+				int index = siblings.indexOf(item);
+				openViewer(siblings.get(Math.floorMod(index + (e.getCode() == KeyCode.LEFT ? -1 : 1), siblings.size())));
+			}
+		});
+		root.getChildren().setAll(viewer);
+		viewer.requestFocus();
+	}
+
+	private Node recapPanel(JsonObject recap) {
+		String outcome = str(recap, "outcome");
+		Label headline = new Label(outcome.equals("WON") ? "Victory" : outcome.equals("LOST") ? "Defeat" : "Fight");
+		headline.setStyle("-fx-font-size: 18; -fx-font-weight: bold; -fx-text-fill: "
+				+ (outcome.equals("WON") ? "#6FE39A" : outcome.equals("LOST") ? "#FF5555" : "#FFC53D") + ";");
+		Label opponent = new Label("vs " + str(recap, "opponent"));
+		opponent.getStyleClass().add("settings-row-hint");
+		VBox panel = new VBox(6, headline, opponent);
+		panel.getStyleClass().add("settings-card");
+		panel.setPrefWidth(220);
+		panel.setMinWidth(220);
+		int dealt = num(recap, "hitsDealt");
+		int attacks = num(recap, "attacks");
+		String[][] rows = {
+				{"Duration", String.format(Locale.ROOT, "%.1fs", dbl(recap, "durationMillis") / 1000)},
+				{"Hits dealt", String.valueOf(dealt)},
+				{"Hits taken", String.valueOf(num(recap, "hitsTaken"))},
+				{"Best combo", String.valueOf(num(recap, "bestCombo"))},
+				{"Crits", String.valueOf(num(recap, "crits"))},
+				{"Accuracy", attacks <= 0 ? "-" : Math.min(100, Math.round(dealt * 100f / attacks)) + "%"},
+				{"Avg reach", dbl(recap, "averageReach") <= 0 ? "-" : String.format(Locale.ROOT, "%.2f", dbl(recap, "averageReach"))},
+				{"Max reach", dbl(recap, "maxReach") <= 0 ? "-" : String.format(Locale.ROOT, "%.2f", dbl(recap, "maxReach"))},
+				{"Damage dealt", String.format(Locale.ROOT, "%.1f ❤", dbl(recap, "damageDealt") / 2)},
+				{"Damage taken", String.format(Locale.ROOT, "%.1f ❤", dbl(recap, "damageTaken") / 2)},
+		};
+		for (String[] row : rows) {
+			Label key = new Label(row[0]);
+			key.getStyleClass().add("settings-row-hint");
+			Label value = new Label(row[1]);
+			value.getStyleClass().add("settings-row-label");
+			Region gap = new Region();
+			HBox.setHgrow(gap, Priority.ALWAYS);
+			panel.getChildren().add(new HBox(8, key, gap, value));
+		}
+		return panel;
+	}
+
+	private static int num(JsonObject o, String key) {
+		return o.has(key) ? o.get(key).getAsInt() : 0;
+	}
+
+	private static double dbl(JsonObject o, String key) {
+		return o.has(key) ? o.get(key).getAsDouble() : 0;
+	}
+
+	private void startPlayback(MjpegAvi.Clip clip, ImageView view, Button play, Slider seek, Label time, StackPane stage) {
+		if (clip.frames().isEmpty()) {
+			return;
+		}
+		int last = clip.frames().size() - 1;
+		double[] position = {0};
+		openClip = clip;
+		playhead = position;
+		boolean[] playing = {true};
+		boolean[] dragging = {false};
+		int[] shown = {-1};
+		play.setOnAction(e -> {
+			if (!playing[0] && position[0] >= last) {
+				position[0] = 0;
+			}
+			playing[0] = !playing[0];
+			play.setText(playing[0] ? "Pause" : "Play");
+		});
+		stage.setOnMouseClicked(e -> play.fire());
+		seek.valueChangingProperty().addListener((o, a, b) -> dragging[0] = b);
+		seek.valueProperty().addListener((o, a, b) -> {
+			if (dragging[0] || seek.isPressed()) {
+				position[0] = b.doubleValue() * last;
+			}
+		});
+		playback = new AnimationTimer() {
+			private long lastNanos;
+
+			@Override
+			public void handle(long now) {
+				if (lastNanos != 0 && playing[0] && !dragging[0]) {
+					position[0] += (now - lastNanos) / 1e9 * clip.fps();
+					if (trim != null && (position[0] > trim[1] || position[0] < trim[0])) {
+						// Trimming: loop the kept part.
+						position[0] = trim[0];
+					} else if (position[0] >= last) {
+						position[0] = last;
+						playing[0] = false;
+						play.setText("Play");
+					}
+				}
+				lastNanos = now;
+				int index = (int) Math.round(position[0]);
+				if (index != shown[0]) {
+					shown[0] = index;
+					view.setImage(new Image(new ByteArrayInputStream(clip.frames().get(index))));
+				}
+				if (!dragging[0] && !seek.isPressed()) {
+					seek.setValue(last == 0 ? 0 : position[0] / last);
+				}
+				time.setText(String.format(Locale.ROOT, "%.1f / %.1fs", position[0] / clip.fps(), clip.seconds()));
+			}
+		};
+		playback.start();
+	}
+
+	/**
+	 * Writes frames {@code from}..{@code to} as a new clip next to the original ("name-trim.avi", numbered if taken),
+	 * with the first kept frame as its thumbnail and the original's fight recap.
+	 */
+	private static Path saveTrimmed(Item item, MjpegAvi.Clip clip, int from, int to) throws java.io.IOException {
+		String base = item.file().getFileName().toString().replaceFirst("\\.avi$", "");
+		Path target = item.file().resolveSibling(base + "-trim.avi");
+		for (int n = 2; Files.exists(target); n++) {
+			target = item.file().resolveSibling(base + "-trim" + n + ".avi");
+		}
+		MjpegAvi.write(target, new ArrayList<>(clip.frames().subList(from, to + 1)), clip.fps(), clip.width(), clip.height());
+		String newBase = target.getFileName().toString().replaceFirst("\\.avi$", "");
+		Files.write(target.resolveSibling(newBase + ".jpg"), clip.frames().get(from));
+		Path meta = item.file().resolveSibling(base + ".json");
+		if (Files.exists(meta)) {
+			Files.copy(meta, target.resolveSibling(newBase + ".json"), StandardCopyOption.REPLACE_EXISTING);
+		}
+		return target;
+	}
+
+	private void stopPlayback() {
+		if (playback != null) {
+			playback.stop();
+			playback = null;
+		}
+		if (proView != null) {
+			proView.release();
+			proView = null;
+		}
+	}
+
+	/**
+	 * A Clips Pro clip: plays here with its sound. Drag the timeline's ends to trim, then Save trimmed (a new clip next
+	 * to it) or Share just that part. Share (Velo+) makes a link to copy or send to a Velo friend, online for 60 days.
+	 */
+	private void openProViewer(Item item) {
+		Button back = BackButton.create(null, null);
+		back.setOnAction(e -> closeViewer());
+		Label title = new Label(label(item));
+		title.getStyleClass().add("page-title");
+		Region spacer = new Region();
+		HBox.setHgrow(spacer, Priority.ALWAYS);
+		ClipPlayerView player = new ClipPlayerView(item.file());
+		proView = player;
+		Label status = new Label("Space play/pause · ←/→ 5 s · M mute · drag the timeline's ends to trim");
+		status.getStyleClass().add("t-muted");
+		Button saveTrim = new Button("Save trimmed", Icons.icon("scissors", 14, javafx.scene.paint.Color.WHITE));
+		saveTrim.getStyleClass().add("primary-button");
+		saveTrim.setVisible(false);
+		saveTrim.setManaged(false);
+		Button resetTrim = new Button("Reset");
+		resetTrim.getStyleClass().add("ghost-button");
+		resetTrim.setVisible(false);
+		resetTrim.setManaged(false);
+		resetTrim.setOnAction(e -> player.resetTrim());
+		boolean plus = net.veloclient.launcher.social.StoreApi.isPlusCached();
+		Button share = new Button(plus ? "Share" : "Share · Velo+", Icons.icon("share", 14, javafx.scene.paint.Color.WHITE));
+		share.getStyleClass().add(plus ? "primary-button" : "glass-button");
+		Button export = new Button("Export", Icons.icon("download", 14, javafx.scene.paint.Color.web("#E4E4E8")));
+		export.getStyleClass().add("glass-button");
+		export.setOnAction(e -> export(item));
+		Button folder = new Button("Folder", Icons.icon("folder", 14, javafx.scene.paint.Color.web("#E4E4E8")));
+		folder.getStyleClass().add("glass-button");
+		folder.setOnAction(e -> openFolder(item.file().getParent()));
+		Button delete = new Button("Delete", Icons.icon("trash", 14, javafx.scene.paint.Color.web("#FF8A8A")));
+		delete.getStyleClass().add("danger-ghost-button");
+		delete.setOnAction(e -> {
+			if (Confirm.ask(owner, "Delete clip?", "This can't be undone.")) {
+				delete(item);
+				closeViewer();
+				load();
+			}
+		});
+		HBox top = new HBox(10, back, title, spacer, resetTrim, saveTrim, share, export, folder, delete);
+		top.setAlignment(Pos.CENTER_LEFT);
+
+		// The link, once there is one: copy it or send it to a friend.
+		VBox sharePanel = new VBox(8);
+		sharePanel.getStyleClass().add("card");
+		sharePanel.setPadding(new Insets(12, 14, 12, 14));
+		sharePanel.setVisible(false);
+		sharePanel.setManaged(false);
+		String[] lastUrl = {null};
+		java.util.function.BiConsumer<String, Long> showLink = (url, expires) -> {
+			lastUrl[0] = url;
+			javafx.scene.control.TextField link = new javafx.scene.control.TextField(url);
+			link.setEditable(false);
+			HBox.setHgrow(link, Priority.ALWAYS);
+			Button copy = new Button("Copy link", Icons.icon("copy", 14, javafx.scene.paint.Color.WHITE));
+			copy.getStyleClass().add("primary-button");
+			copy.setOnAction(e -> {
+				ClipboardContent content = new ClipboardContent();
+				content.putString(url);
+				Clipboard.getSystemClipboard().setContent(content);
+				Toasts.show(copy, "Link copied");
+			});
+			ComboBox<net.veloclient.launcher.social.LauncherSocial.Friend> friend = new ComboBox<>();
+			var social = net.veloclient.launcher.social.LauncherSocial.snapshot();
+			if (social != null && social.friends != null) {
+				friend.getItems().setAll(social.friends.stream()
+						.sorted(Comparator.comparing((net.veloclient.launcher.social.LauncherSocial.Friend f) -> !f.online)
+								.thenComparing(f -> f.username.toLowerCase(Locale.ROOT))).toList());
+			}
+			friend.setPromptText(friend.getItems().isEmpty() ? "Add friends to send it to them" : "Send to a friend...");
+			friend.setConverter(new javafx.util.StringConverter<>() {
+				@Override
+				public String toString(net.veloclient.launcher.social.LauncherSocial.Friend f) {
+					return f == null ? "" : (f.online ? "● " : "") + f.username;
+				}
+
+				@Override
+				public net.veloclient.launcher.social.LauncherSocial.Friend fromString(String s) {
+					return null;
+				}
+			});
+			Button send = new Button("Send", Icons.icon("send", 14, javafx.scene.paint.Color.web("#E4E4E8")));
+			send.getStyleClass().add("glass-button");
+			send.disableProperty().bind(friend.valueProperty().isNull());
+			send.setOnAction(e -> {
+				var to = friend.getValue();
+				net.veloclient.launcher.social.LauncherSocial.sendMessage(to.uuid, "Check out my clip: " + url).thenAccept(error ->
+						Platform.runLater(() -> Toasts.show(send, error == null ? "Sent to " + to.username : "Couldn't send: " + error)));
+			});
+			Label note = new Label(expires != null && expires > 0
+					? "Online until " + DateTimeFormatter.ofPattern("d MMM yyyy", Locale.ENGLISH).withZone(ZoneId.systemDefault()).format(Instant.ofEpochMilli(expires))
+							+ " - shared clips are deleted after " + net.veloclient.velo.client.clips.core.ClipTools.DEFAULT_RETENTION_DAYS + " days"
+					: "Shared clips stay online for " + net.veloclient.velo.client.clips.core.ClipTools.DEFAULT_RETENTION_DAYS + " days, then they're deleted");
+			note.getStyleClass().add("t-muted");
+			HBox row = new HBox(10, Icons.icon("link", 16, javafx.scene.paint.Color.web("#A9A9B3")), link, copy, friend, send);
+			row.setAlignment(Pos.CENTER_LEFT);
+			sharePanel.getChildren().setAll(row, note);
+			sharePanel.setVisible(true);
+			sharePanel.setManaged(true);
+		};
+		String known = net.veloclient.launcher.media.ClipSharing.sharedUrl(item.meta());
+		if (known != null) {
+			showLink.accept(known, item.meta().has("shareExpires") ? item.meta().get("shareExpires").getAsLong() : null);
+		}
+		share.setOnAction(e -> {
+			if (!plus) {
+				status.setText("Share links are part of Velo+ - get it in the Store. Shared clips stay online for "
+						+ net.veloclient.velo.client.clips.core.ClipTools.DEFAULT_RETENTION_DAYS + " days.");
+				return;
+			}
+			boolean trimmed = player.trimmed();
+			if (!trimmed && known != null) {
+				showLink.accept(known, item.meta().has("shareExpires") ? item.meta().get("shareExpires").getAsLong() : null);
+				return;
+			}
+			share.setDisable(true);
+			net.veloclient.launcher.media.ClipSharing.share(item.file(), item.meta(), trimmed ? player.trimFrom() : -1, trimmed ? player.trimTo() : -1,
+					status::setText, shared -> {
+						share.setDisable(false);
+						if (shared != null) {
+							ClipboardContent content = new ClipboardContent();
+							content.putString(shared.url());
+							Clipboard.getSystemClipboard().setContent(content);
+							status.setText("Link copied: " + shared.url());
+							showLink.accept(shared.url(), shared.expiresAt());
+						}
+					});
+		});
+		player.onTrimChanged(() -> {
+			boolean trimmed = player.trimmed();
+			for (Button b : new Button[] {saveTrim, resetTrim}) {
+				b.setVisible(trimmed);
+				b.setManaged(trimmed);
+			}
+			share.setText(!plus ? "Share · Velo+" : trimmed ? "Share part" : "Share");
+		});
+		saveTrim.setOnAction(e -> {
+			Path ffmpeg = ClipPlayerView.ffmpeg();
+			if (ffmpeg == null) {
+				return;
+			}
+			double from = player.trimFrom();
+			double to = player.trimTo();
+			saveTrim.setDisable(true);
+			status.setText("Saving the trimmed part...");
+			LOADER.execute(() -> {
+				String result;
+				try {
+					String base = item.file().getFileName().toString().replaceFirst("\\.mp4$", "");
+					String name = base + "-trim-" + System.currentTimeMillis() / 1000;
+					Path out = item.file().resolveSibling(name + ".mp4");
+					net.veloclient.velo.client.clips.core.ClipTools.trim(ffmpeg, item.file(), out, from, to);
+					net.veloclient.velo.client.clips.core.ClipTools.thumbnail(ffmpeg, out, (to - from) * 2 / 3, out.resolveSibling(name + ".jpg"));
+					JsonObject meta = item.meta() == null ? new JsonObject() : item.meta().deepCopy();
+					meta.remove("shareUrl");
+					meta.remove("shareExpires");
+					meta.addProperty("seconds", to - from);
+					meta.addProperty("trimmedFrom", item.file().getFileName().toString());
+					Files.writeString(out.resolveSibling(name + ".json"), meta.toString(), StandardCharsets.UTF_8);
+					result = "Saved the trimmed clip (" + Math.round(to - from) + " s)";
+				} catch (Exception ex) {
+					LauncherLog.warn("Couldn't trim the clip", ex);
+					result = "Couldn't trim: " + ex.getMessage();
+				}
+				String message = result;
+				Platform.runLater(() -> {
+					saveTrim.setDisable(false);
+					status.setText(message);
+					Toasts.show(saveTrim, message);
+					load();
+				});
+			});
+		});
+
+		Node body = player;
+		VBox.setVgrow(player, Priority.ALWAYS);
+		if (item.meta() != null && item.meta().has("recap")) {
+			HBox.setHgrow(player, Priority.ALWAYS);
+			body = new HBox(14, player, recapPanel(item.meta().getAsJsonObject("recap")));
+			VBox.setVgrow(body, Priority.ALWAYS);
+		}
+		VBox viewer = new VBox(12, top, sharePanel, body, status);
+		viewer.setOnKeyPressed(e -> {
+			if (e.getCode() == KeyCode.ESCAPE) {
+				closeViewer();
+			}
+		});
+		root.getChildren().setAll(viewer);
+		player.requestFocus();
+	}
+
+	private void closeViewer() {
+		stopPlayback();
+		root.getChildren().setAll(gallery);
+	}
+
+	private void export(Item item) {
+		FileChooser chooser = new FileChooser();
+		chooser.setInitialFileName(item.file().getFileName().toString());
+		chooser.setInitialDirectory(Path.of(System.getProperty("user.home")).toFile());
+		var target = chooser.showSaveDialog(owner);
+		if (target == null) {
+			return;
+		}
+		try {
+			Files.copy(item.file(), target.toPath(), StandardCopyOption.REPLACE_EXISTING);
+		} catch (Exception e) {
+			LauncherLog.warn("Export failed", e);
+			ErrorDialog.show(owner, "Export failed", e.getMessage(), null, null);
+		}
+	}
+
+	private static void delete(Item item) {
+		try {
+			Files.deleteIfExists(item.file());
+			if (item.clip()) {
+				String base = item.file().getFileName().toString().replaceFirst("\\.(avi|mp4)$", "");
+				Files.deleteIfExists(item.file().resolveSibling(base + ".jpg"));
+				Files.deleteIfExists(item.file().resolveSibling(base + ".json"));
+			}
+		} catch (Exception e) {
+			LauncherLog.warn("Couldn't delete " + item.file(), e);
+		}
+	}
+
+	private static void openFolder(Path folder) {
+		try {
+			Files.createDirectories(folder);
+			String os = System.getProperty("os.name", "").toLowerCase(Locale.ROOT);
+			if (os.contains("win")) {
+				new ProcessBuilder("explorer", folder.toString()).start();
+			} else if (os.contains("mac")) {
+				new ProcessBuilder("open", folder.toString()).start();
+			} else {
+				new ProcessBuilder("xdg-open", folder.toString()).start();
+			}
+		} catch (Exception e) {
+			LauncherLog.warn("Couldn't open " + folder, e);
+		}
+	}
+}

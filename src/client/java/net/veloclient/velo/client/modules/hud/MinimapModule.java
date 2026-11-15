@@ -1,0 +1,357 @@
+package net.veloclient.velo.client.modules.hud;
+
+import net.minecraft.client.MinecraftClient;
+import net.minecraft.client.gl.RenderPipelines;
+import net.minecraft.client.gui.DrawContext;
+import net.minecraft.entity.player.PlayerEntity;
+import net.minecraft.util.Identifier;
+import net.veloclient.velo.client.gui.widget.VeloDraw;
+import net.veloclient.velo.client.hud.HudModule;
+import net.veloclient.velo.client.hud.HudPosition;
+import net.veloclient.velo.client.theme.Theme;
+import net.veloclient.velo.client.theme.ThemeManager;
+import net.veloclient.velo.module.AbstractModule;
+import net.veloclient.velo.module.ConfigField;
+import net.veloclient.velo.module.Configurable;
+import net.veloclient.velo.module.ModuleCategory;
+import net.veloclient.velo.module.SafetyTag;
+
+import java.util.List;
+
+/**
+ * A Xaero-style top-down minimap: nearby terrain sampled through vanilla's
+ * own block-to-map-color system ({@link MinimapManager}), drawn rotating
+ * underneath a fixed player arrow (or north-locked, with a rotating arrow
+ * instead) inside a framed square box, with optional coordinates/facing
+ * readout below it. Sized/positioned/scaled through the same drag-and-scale
+ * system every other HUD module uses (design spec section 5/7) - nothing
+ * minimap-specific there.
+ */
+public final class MinimapModule extends AbstractModule implements HudModule, Configurable {
+
+	private static final int BORDER_THICKNESS = 2;
+
+	private final HudPosition position = new HudPosition(0.85f, 0.02f);
+
+	private int mapSize = 128;
+	private int viewRadius = 96;
+	private int refreshMillis = 750;
+	private boolean rotateWithPlayer = true;
+	private boolean showArrow = true;
+	private double arrowSize = 6;
+	private boolean showCoordinates = true;
+	private boolean showFacing = true;
+	private int borderColor = 0xFF2A2A2A;
+	private int arrowColor = 0xFFFF4747;
+	/** "Square" or "Round". */
+	private String shape = "Square";
+	/** Round style: N / E / S / W around the rim (they turn with the map). */
+	private boolean compassLetters = true;
+
+	public MinimapModule() {
+		super("minimap", "Minimap", "A rotating top-down minimap of nearby terrain, sampled from vanilla's own map colors.",
+				ModuleCategory.HUD, SafetyTag.CHECK_SERVER_RULES, false);
+	}
+
+	@Override
+	public HudPosition position() {
+		return position;
+	}
+
+	@Override
+	public void render(DrawContext context, int x, int y, float tickDelta) {
+		MinecraftClient client = MinecraftClient.getInstance();
+		PlayerEntity player = client.player;
+		if (player == null || client.world == null) {
+			return;
+		}
+
+		Theme theme = ThemeManager.active();
+		// Plain rectangular fill, not a rounded one - a solid square behind
+		// an inset viewport is both a sharp-cornered border and (mostly)
+		// centered. The right/bottom edges get one extra pixel of inset
+		// pulled back in - fill()/enableScissor() were visibly leaving a
+		// thicker strip there than on the left/top at non-1.0 HUD scale,
+		// most likely from the outer HudManager scale transform rounding
+		// the two calls' corners slightly differently - so this corrects
+		// for it directly rather than chasing the rounding itself.
+		if (shape.equals("Round")) {
+			renderRound(context, player, x, y);
+			drawInfo(context, client, player, theme, x, y);
+			return;
+		}
+		context.fill(x, y, x + mapSize, y + mapSize, borderColor);
+
+		int viewportX = x + BORDER_THICKNESS;
+		int viewportY = y + BORDER_THICKNESS;
+		int viewportSize = mapSize - BORDER_THICKNESS * 2 + 1;
+
+		// Sampled a bit wider than the visible view radius so a rotated map
+		// still has real terrain data at the box's corners instead of
+		// running out of texture there - a square raster's own corners
+		// already reach sqrt(2)*radius, but only along its own fixed
+		// diagonals, not whichever screen-space diagonal the box's corners
+		// land on after rotation, so this needs real margin, not just luck.
+		int sampleRadius = Math.max(viewRadius, Math.round(viewRadius * 1.5f));
+		Identifier texture = MinimapManager.textureFor(sampleRadius, refreshMillis);
+
+		context.enableScissor(viewportX, viewportY, viewportX + viewportSize, viewportY + viewportSize);
+		context.fill(viewportX, viewportY, viewportX + viewportSize, viewportY + viewportSize, 0xFF1A1A1A);
+		if (texture != null) {
+			drawRotatedMap(context, player, texture, sampleRadius, viewportX, viewportY, viewportSize);
+		}
+		context.disableScissor();
+
+		if (WaypointsModule.showOnMinimap && net.veloclient.velo.client.waypoints.WaypointRenderer.Settings.enabled) {
+			drawWaypoints(context, player, viewportX, viewportY, viewportSize);
+		}
+
+		if (showArrow) {
+			drawPlayerArrow(context, player, viewportX + viewportSize / 2, viewportY + viewportSize / 2);
+		}
+
+		drawInfo(context, client, player, theme, x, y);
+	}
+
+	private void drawInfo(DrawContext context, MinecraftClient client, PlayerEntity player, Theme theme, int x, int y) {
+		int infoY = y + mapSize + 2;
+		if (showCoordinates) {
+			String coords = String.format("%d, %d, %d", player.getBlockX(), player.getBlockY(), player.getBlockZ());
+			net.veloclient.velo.client.hud.HudLook.draw(context, coords, x, infoY, theme.text());
+			infoY += client.textRenderer.fontHeight + 1;
+		}
+		if (showFacing) {
+			net.veloclient.velo.client.hud.HudLook.draw(context, facingLabel(player.getYaw()), x, infoY, theme.text());
+		}
+	}
+
+	/**
+	 * The round style: the map clipped to a circle by drawing it in thin horizontal bands, each scissored to the
+	 * circle's width at that height (GUI drawing has no masks), then an anti-aliased ring over the stepped edge.
+	 */
+	private void renderRound(DrawContext context, PlayerEntity player, int x, int y) {
+		float r = mapSize / 2f;
+		float cx = x + r;
+		float cy = y + r;
+		int sampleRadius = Math.max(viewRadius, Math.round(viewRadius * 1.5f));
+		Identifier texture = MinimapManager.textureFor(sampleRadius, refreshMillis);
+		VeloDraw.fillCircle(context, cx, cy, r - 1, 0xFF1A1A1A);
+		if (texture != null) {
+			int band = 2;
+			for (int by = y + 1; by < y + mapSize - 1; by += band) {
+				float mid = by + band / 2f - cy;
+				float half = (float) Math.sqrt(Math.max(0, (r - 1) * (r - 1) - mid * mid));
+				if (half < 1) {
+					continue;
+				}
+				context.enableScissor(Math.round(cx - half), by, Math.round(cx + half), by + band);
+				drawRotatedMap(context, player, texture, sampleRadius, x, y, mapSize);
+				context.disableScissor();
+			}
+		}
+		VeloDraw.strokeArc(context, cx, cy, r - BORDER_THICKNESS / 2f, BORDER_THICKNESS + 1, 0, 360, borderColor | 0xFF000000);
+		if (compassLetters) {
+			float angle = rotateWithPlayer ? mapRotationRadians(player.getYaw()) : 0f;
+			String[] letters = {"N", "E", "S", "W"};
+			for (int i = 0; i < 4; i++) {
+				// North is "up" (-z) on the unrotated map; each letter turns with it.
+				double a = angle + i * Math.PI / 2;
+				float lx = cx + (float) Math.sin(a) * (r - 1);
+				float ly = cy - (float) Math.cos(a) * (r - 1);
+				String letter = letters[i];
+				int w = net.veloclient.velo.client.hud.HudLook.measure(letter);
+				VeloDraw.fillCircle(context, lx, ly, 5f, 0xE0101014);
+				net.veloclient.velo.client.hud.HudLook.draw(context, letter, Math.round(lx - w / 2f), Math.round(ly - 4), i == 0 ? arrowColor : 0xFFE4E4E8);
+			}
+		}
+		if (WaypointsModule.showOnMinimap && net.veloclient.velo.client.waypoints.WaypointRenderer.Settings.enabled) {
+			drawWaypoints(context, player, x, y, mapSize);
+		}
+		if (showArrow) {
+			drawPlayerArrow(context, player, Math.round(cx), Math.round(cy));
+		}
+	}
+
+	/** Screen angle (radians) that rotates the map so the player's facing direction points up - 0 rotation leaves the map north-up, since row 0 of the sampled texture is the northernmost column. Facing yaw 180 is due north, so that's the zero point. Flip the sign here if a live test shows it turning the wrong way. */
+	private static float mapRotationRadians(float yaw) {
+		return (float) Math.toRadians(180 - yaw);
+	}
+
+	private void drawRotatedMap(DrawContext context, PlayerEntity player, Identifier texture, int sampleRadius,
+			int viewportX, int viewportY, int viewportSize) {
+		int textureSize = sampleRadius * 2 + 1;
+		float scale = viewportSize / (2f * viewRadius);
+		float offsetX = (float) (player.getX() - MinimapManager.centerX());
+		float offsetZ = (float) (player.getZ() - MinimapManager.centerZ());
+
+		context.getMatrices().pushMatrix();
+		context.getMatrices().translate(viewportX + viewportSize / 2f, viewportY + viewportSize / 2f);
+		if (rotateWithPlayer) {
+			context.getMatrices().rotate(mapRotationRadians(player.getYaw()));
+		}
+		context.getMatrices().scale(scale, scale);
+		context.getMatrices().translate(-(sampleRadius + offsetX), -(sampleRadius + offsetZ));
+		int texturePixels = textureSize * MinimapManager.PX;
+		context.drawTexture(RenderPipelines.GUI_TEXTURED, texture, 0, 0, 0f, 0f,
+				textureSize, textureSize, texturePixels, texturePixels, texturePixels, texturePixels);
+		context.getMatrices().popMatrix();
+	}
+
+	/**
+	 * Waypoints of this world+dimension as small icons/dots, rotated with the map; ones beyond the
+	 * map's range sit pinned to its edge in their direction so you can still see which way to go.
+	 */
+	private void drawWaypoints(DrawContext context, PlayerEntity player, int viewportX, int viewportY, int viewportSize) {
+		float scale = viewportSize / (2f * viewRadius);
+		float angle = rotateWithPlayer ? mapRotationRadians(player.getYaw()) : 0f;
+		float sin = (float) Math.sin(angle);
+		float cos = (float) Math.cos(angle);
+		float half = viewportSize / 2f;
+		float centerX = viewportX + half;
+		float centerY = viewportY + half;
+		for (var waypoint : net.veloclient.velo.client.waypoints.WaypointManager.visibleHere()) {
+			float dx = (float) (waypoint.blockX() + 0.5 - player.getX()) * scale;
+			float dz = (float) (waypoint.blockZ() + 0.5 - player.getZ()) * scale;
+			float px = dx * cos - dz * sin;
+			float py = dx * sin + dz * cos;
+			float limit = half - 5;
+			boolean round = shape.equals("Round");
+			float reach = round ? (float) Math.hypot(px, py) : Math.max(Math.abs(px), Math.abs(py));
+			boolean pinned = reach > limit;
+			if (pinned) {
+				// On the edge in its direction: the square's border, or the circle's rim.
+				float factor = limit / reach;
+				px *= factor;
+				py *= factor;
+			}
+			int x = Math.round(centerX + px);
+			int y = Math.round(centerY + py);
+			int color = waypoint.color | 0xFF000000;
+			var stack = net.veloclient.velo.client.waypoints.WaypointIcons.stack(waypoint.icon);
+			if (stack != null && !pinned) {
+				net.veloclient.velo.client.gui.widget.VeloDraw.fillCircle(context, x, y, 5, 0xC0101014);
+				context.getMatrices().pushMatrix();
+				context.getMatrices().translate(x - 4f, y - 4f);
+				context.getMatrices().scale(0.5f, 0.5f);
+				context.drawItemWithoutEntity(stack, 0, 0);
+				context.getMatrices().popMatrix();
+			} else {
+				net.veloclient.velo.client.gui.widget.VeloDraw.fillCircle(context, x, y, pinned ? 3 : 4, 0xFF101014);
+				net.veloclient.velo.client.gui.widget.VeloDraw.fillCircle(context, x, y, pinned ? 2 : 3, color);
+			}
+		}
+	}
+
+	private void drawPlayerArrow(DrawContext context, PlayerEntity player, int centerX, int centerY) {
+		float angle = rotateWithPlayer ? 0f : (float) Math.toRadians(player.getYaw() + 180);
+		float size = (float) arrowSize;
+		// a dark outline first (one pixel bigger all round), then the arrow: readable on any terrain and at any size
+		drawArrowShape(context, centerX, centerY, angle, size + 1.6f, 0xE0101014);
+		drawArrowShape(context, centerX, centerY, angle, size, arrowColor | 0xFF000000);
+	}
+
+	/** An arrowhead with a notched back, rotated by hand (not through the matrix stack, so the map's zoom never stretches it). */
+	private static void drawArrowShape(DrawContext context, int centerX, int centerY, float angle, float size, int color) {
+		float sin = (float) Math.sin(angle);
+		float cos = (float) Math.cos(angle);
+		float[][] tris = {
+				{0, -size, -size * 0.62f, size * 0.62f, 0, size * 0.28f},
+				{0, -size, 0, size * 0.28f, size * 0.62f, size * 0.62f}};
+		for (float[] t : tris) {
+			int[] xs = new int[3];
+			int[] ys = new int[3];
+			for (int i = 0; i < 3; i++) {
+				float lx = t[i * 2];
+				float ly = t[i * 2 + 1];
+				xs[i] = centerX + Math.round(lx * cos - ly * sin);
+				ys[i] = centerY + Math.round(lx * sin + ly * cos);
+			}
+			fillTriangle(context, xs, ys, color);
+		}
+	}
+
+	/** Cheap scanline triangle fill - the arrow is only ever 3 points, not worth pulling in a general polygon renderer for. */
+	private static void fillTriangle(DrawContext context, int[] xs, int[] ys, int color) {
+		int minY = Math.min(ys[0], Math.min(ys[1], ys[2]));
+		int maxY = Math.max(ys[0], Math.max(ys[1], ys[2]));
+		// Rows with the same span go out as one rectangle (the arrow's flat parts were one fill per pixel row).
+		int runX0 = 0;
+		int runX1 = -1;
+		int runY = minY;
+		for (int py = minY; py <= maxY; py++) {
+			double minX = Double.MAX_VALUE;
+			double maxX = -Double.MAX_VALUE;
+			for (int i = 0; i < 3; i++) {
+				int j = (i + 1) % 3;
+				int y1 = ys[i];
+				int y2 = ys[j];
+				if (y1 == y2) {
+					continue;
+				}
+				if ((py >= y1 && py < y2) || (py >= y2 && py < y1)) {
+					double t = (py - y1) / (double) (y2 - y1);
+					double x = xs[i] + t * (xs[j] - xs[i]);
+					minX = Math.min(minX, x);
+					maxX = Math.max(maxX, x);
+				}
+			}
+			int x0 = minX <= maxX ? (int) Math.round(minX) : 0;
+			int x1 = minX <= maxX ? (int) Math.round(maxX) + 1 : -1;
+			if (x0 != runX0 || x1 != runX1) {
+				if (runX1 > runX0) {
+					context.fill(runX0, runY, runX1, py, color);
+				}
+				runX0 = x0;
+				runX1 = x1;
+				runY = py;
+			}
+		}
+		if (runX1 > runX0) {
+			context.fill(runX0, runY, runX1, maxY + 1, color);
+		}
+	}
+
+	private static String facingLabel(float yaw) {
+		float normalized = yaw % 360f;
+		if (normalized < 0) {
+			normalized += 360f;
+		}
+		String[] names = {"S", "SW", "W", "NW", "N", "NE", "E", "SE"};
+		int index = Math.round(normalized / 45f) % 8;
+		return names[index] + " " + Math.round(normalized) + "°";
+	}
+
+	@Override
+	public int width() {
+		return mapSize;
+	}
+
+	@Override
+	public int height() {
+		int extra = 0;
+		if (showCoordinates) {
+			extra += MinecraftClient.getInstance().textRenderer.fontHeight + 1;
+		}
+		if (showFacing) {
+			extra += MinecraftClient.getInstance().textRenderer.fontHeight + 1;
+		}
+		return mapSize + (extra > 0 ? extra + 2 : 0);
+	}
+
+	@Override
+	public List<ConfigField> configFields() {
+		return List.of(
+				new ConfigField.ChoiceField("Shape", List.of("Square", "Round"), () -> shape, v -> shape = v),
+				new ConfigField.ToggleField("Compass Letters (Round)", () -> compassLetters, v -> compassLetters = v),
+				new ConfigField.SliderField("Map Size", 64, 220, () -> mapSize, v -> mapSize = (int) v, v -> Math.round(v) + "px"),
+				new ConfigField.SliderField("View Radius", 24, 200, () -> viewRadius, v -> viewRadius = (int) v, v -> Math.round(v) + " blocks"),
+				new ConfigField.SliderField("Refresh Rate", 200, 3000, () -> refreshMillis, v -> refreshMillis = (int) v, v -> Math.round(v) + "ms"),
+				new ConfigField.ToggleField("Rotate With Player", () -> rotateWithPlayer, v -> rotateWithPlayer = v),
+				new ConfigField.ToggleField("Show Player Arrow", () -> showArrow, v -> showArrow = v),
+				new ConfigField.SliderField("Arrow Size", 3, 18, () -> arrowSize, v -> arrowSize = Math.round(v * 2) / 2.0, v -> String.format(java.util.Locale.ROOT, "%.1f", v)),
+				new ConfigField.ToggleField("Show Coordinates", () -> showCoordinates, v -> showCoordinates = v),
+				new ConfigField.ToggleField("Show Facing", () -> showFacing, v -> showFacing = v),
+				new ConfigField.ColorField("Border Color", () -> borderColor, v -> borderColor = v, false),
+				new ConfigField.ColorField("Arrow Color", () -> arrowColor, v -> arrowColor = v, false));
+	}
+}

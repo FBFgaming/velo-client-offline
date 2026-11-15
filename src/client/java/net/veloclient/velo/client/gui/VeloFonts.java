@@ -1,0 +1,253 @@
+package net.veloclient.velo.client.gui;
+
+import net.minecraft.client.gui.screen.GameMenuScreen;
+import net.minecraft.client.gui.screen.Screen;
+import net.minecraft.client.gui.screen.TitleScreen;
+import net.minecraft.util.Identifier;
+import net.veloclient.velo.client.gui.window.VeloWindow;
+import net.veloclient.velo.client.util.ClientCompat;
+//? if <26.1 {
+import net.minecraft.text.StyleSpriteSource;
+//?} else {
+/*import net.minecraft.network.chat.FontDescription;
+*///?}
+
+/**
+ * Makes every Velo menu render in Inter instead of the blocky vanilla pixel font, and keeps the
+ * custom fonts crisp.
+ *
+ * Why per-scale fonts: vanilla samples glyph atlases with NEAREST filtering, so a TTF rasterized
+ * at 8x oversample and drawn at GUI scale 2-3 gets shrunk by dropping texels - that's what made
+ * the old Poppins/Anta text look jagged. Each font is therefore defined once per GUI scale
+ * ({@code ui_1..ui_6}, oversample = scale), and lookups pick the one whose texels map 1:1 onto
+ * screen pixels.
+ *
+ * Scope: Velo's own font ids are always remapped; the vanilla default font only while a Velo
+ * screen (or the themed title screen) is open, and never while the in-game HUD draws underneath
+ * it (chat, hotbar and Velo's HUD modules keep their usual look). Glyph lookup happens when text
+ * is drawn/measured (GuiRenderState prepares text eagerly), so a simple flag is exact.
+ */
+public final class VeloFonts {
+
+	private static final int MAX_SCALE = 6;
+	/** HUD fonts (HUD Style families, Inter, Inter bold) go further: a scaled-up HUD element at GUI scale 4 needs 8x. */
+	private static final int MAX_HUD_SCALE = 8;
+	/** The scale the HUD element being drawn is posed at (HudManager.renderScaled), so its text gets a matching atlas. */
+	private static float hudPoseScale = 1f;
+
+	//? if <26.1 {
+	private static final StyleSpriteSource[] UI = fonts("ui", MAX_HUD_SCALE);
+	private static final StyleSpriteSource[] UI_BOLD = fonts("ui_bold", MAX_HUD_SCALE);
+	private static final StyleSpriteSource[] TITLE = fonts("title");
+	private static final StyleSpriteSource[] BIG = fonts("big");
+	private static final StyleSpriteSource[] DISPLAY = fonts("display");
+	private static final StyleSpriteSource[] DISPLAY_SM = fonts("display_sm");
+	private static final StyleSpriteSource[] DISPLAY_LG = fonts("display_lg");
+	private static final StyleSpriteSource[] HERO = fonts("hero");
+	private static final StyleSpriteSource[] UI_SM = fonts("ui_sm");
+	private static final StyleSpriteSource[] MONO = fonts("mono");
+	//?} else {
+	/*private static final FontDescription[] UI = fonts("ui", MAX_HUD_SCALE);
+	private static final FontDescription[] HERO = fonts("hero");
+	private static final FontDescription[] UI_SM = fonts("ui_sm");
+	private static final FontDescription[] UI_BOLD = fonts("ui_bold", MAX_HUD_SCALE);
+	private static final FontDescription[] TITLE = fonts("title");
+	private static final FontDescription[] BIG = fonts("big");
+	private static final FontDescription[] DISPLAY = fonts("display");
+	private static final FontDescription[] DISPLAY_SM = fonts("display_sm");
+	private static final FontDescription[] DISPLAY_LG = fonts("display_lg");
+	private static final FontDescription[] MONO = fonts("mono");
+	*///?}
+
+	private static int hudDepth;
+
+	// Font health (2026-11-08): on some Windows PCs Velo's TrueType fonts never load and every Velo menu - the title
+	// screen first - showed no text at all. The title screen measures "iiiiiiii" against "WWWWWWWW" in Velo's font every
+	// couple of seconds; when they come out the same (the missing-glyph box) or empty, Velo menus use Minecraft's own font
+	// until a later check (after a resource reload) finds Velo's fonts working.
+	private static volatile boolean broken;
+	private static boolean checking;
+	private static long lastCheckNanos;
+
+	/** Whether the title screen should measure the fonts now. */
+	public static boolean needsHealthCheck() {
+		return System.nanoTime() - lastCheckNanos > 2_000_000_000L;
+	}
+
+	/** Measure with Velo's fonts active (even when they were found broken), then {@link #endHealthCheck}. */
+	public static void beginHealthCheck() {
+		checking = true;
+	}
+
+	public static void endHealthCheck(int narrowWidth, int wideWidth) {
+		checking = false;
+		lastCheckNanos = System.nanoTime();
+		boolean bad = narrowWidth <= 0 || wideWidth <= 0 || narrowWidth >= wideWidth;
+		if (bad != broken) {
+			org.slf4j.LoggerFactory.getLogger("velo-client").warn(bad
+					? "Velo's fonts didn't load (iiiiiiii = " + narrowWidth + " px, WWWWWWWW = " + wideWidth + " px) - Velo menus use Minecraft's font"
+					: "Velo's fonts work again");
+		}
+		broken = bad;
+	}
+
+	public static boolean fontsBroken() {
+		return broken && !checking;
+	}
+	/** The HUD Style fonts ({@code hud_<family>}), per scale, made on first use. */
+	//? if <26.1 {
+	private static final java.util.Map<String, StyleSpriteSource[]> HUD = new java.util.concurrent.ConcurrentHashMap<>();
+	//?} else {
+	/*private static final java.util.Map<String, FontDescription[]> HUD = new java.util.concurrent.ConcurrentHashMap<>();
+	*///?}
+
+	private VeloFonts() {
+	}
+
+	/** In-game HUD rendering brackets itself with these so it keeps the vanilla font under a Velo menu. */
+	public static void beginHud() {
+		hudDepth++;
+	}
+
+	public static void endHud() {
+		hudDepth = Math.max(0, hudDepth - 1);
+	}
+
+	/** True while the default font should be swapped for Inter. */
+	public static boolean menuScope() {
+		if (hudDepth > 0 || fontsBroken()) {
+			return false;
+		}
+		Screen screen = ClientCompat.currentScreen();
+		return screen instanceof VeloWindow || screen instanceof HudEditScreen || screen instanceof TitleScreen && VeloScreens.title()
+				|| screen instanceof GameMenuScreen && VeloScreens.pause();
+	}
+
+	/** Sets the pose scale of the HUD element about to draw; returns the previous one to restore. */
+	public static float setHudPoseScale(float scale) {
+		float previous = hudPoseScale;
+		hudPoseScale = scale > 0 ? scale : 1f;
+		return previous;
+	}
+
+	/** Atlas for HUD-capable fonts: inside the HUD the element's own scale counts too (texels 1:1 on screen pixels). */
+	private static int hudScaleIndex() {
+		if (hudDepth == 0) {
+			return scaleIndex();
+		}
+		int scale = Math.round(ClientCompat.guiScale() * hudPoseScale);
+		return Math.max(1, Math.min(MAX_HUD_SCALE, scale)) - 1;
+	}
+
+	private static int scaleIndex() {
+		// A dense Velo window draws at a finer scale - its text uses that scale's atlas (the HUD under it keeps the real one).
+		int scale = hudDepth == 0 && net.veloclient.velo.client.gui.window.DenseGui.active()
+				? net.veloclient.velo.client.gui.window.DenseGui.effectiveScale() : ClientCompat.guiScale();
+		return Math.max(1, Math.min(MAX_SCALE, scale)) - 1;
+	}
+
+	//? if <26.1 {
+	private static StyleSpriteSource[] fonts(String base) {
+		return fonts(base, MAX_SCALE);
+	}
+
+	private static StyleSpriteSource[] fonts(String base, int count) {
+		StyleSpriteSource[] out = new StyleSpriteSource[count];
+		for (int i = 0; i < count; i++) {
+			out[i] = new StyleSpriteSource.Font(Identifier.of("velo-client", base + "_" + (i + 1)));
+		}
+		return out;
+	}
+
+	private static StyleSpriteSource[] hudFonts(String base) {
+		return fonts(base, MAX_HUD_SCALE);
+	}
+
+	public static StyleSpriteSource remap(StyleSpriteSource source) {
+		if (source == StyleSpriteSource.DEFAULT || StyleSpriteSource.DEFAULT.equals(source)) {
+			return menuScope() ? UI[scaleIndex()] : source;
+		}
+		if (source instanceof StyleSpriteSource.Font font) {
+			if (fontsBroken() && "velo-client".equals(font.id().getNamespace())) {
+				return StyleSpriteSource.DEFAULT;
+			}
+			return remapVelo(font.id(), source);
+		}
+		return source;
+	}
+
+	private static StyleSpriteSource remapVelo(Identifier id, StyleSpriteSource fallback) {
+	//?} else {
+	/*private static FontDescription[] fonts(String base) {
+		return fonts(base, MAX_SCALE);
+	}
+
+	private static FontDescription[] fonts(String base, int count) {
+		FontDescription[] out = new FontDescription[count];
+		for (int i = 0; i < count; i++) {
+			out[i] = new FontDescription.Resource(Identifier.of("velo-client", base + "_" + (i + 1)));
+		}
+		return out;
+	}
+
+	private static FontDescription[] hudFonts(String base) {
+		return fonts(base, MAX_HUD_SCALE);
+	}
+
+	public static FontDescription remap(FontDescription source) {
+		if (source == FontDescription.DEFAULT || FontDescription.DEFAULT.equals(source)) {
+			return menuScope() ? UI[scaleIndex()] : source;
+		}
+		if (source instanceof FontDescription.Resource font) {
+			if (fontsBroken() && "velo-client".equals(font.id().getNamespace())) {
+				return FontDescription.DEFAULT;
+			}
+			return remapVelo(font.id(), source);
+		}
+		return source;
+	}
+
+	private static FontDescription remapVelo(Identifier id, FontDescription fallback) {
+	*///?}
+		if (!"velo-client".equals(id.getNamespace())) {
+			return fallback;
+		}
+		// Name Styles mark a styled name's letters with ns/... - drawn in the font the style picked.
+		String nameFont = net.veloclient.velo.client.namestyle.NameStyles.markerFont(id.getPath());
+		if (nameFont != null) {
+			Identifier target = Identifier.of(nameFont.substring(0, nameFont.indexOf(':')), nameFont.substring(nameFont.indexOf(':') + 1));
+			// Above heads the text is drawn big in the world: always the sharpest variant (most oversampling), not the GUI scale's.
+			if (net.veloclient.velo.client.namestyle.NameStyles.isNameTagMarker(id.getPath()) && "velo-client".equals(target.getNamespace())) {
+				String base = target.getPath();
+				// The last variant has the most oversampling (index 0 is oversample 1 - very blurry when drawn big).
+				if (base.equals("ui")) {
+					return UI[MAX_HUD_SCALE - 1];
+				}
+				if (base.startsWith("hud_")) {
+					return HUD.computeIfAbsent(base, VeloFonts::hudFonts)[MAX_HUD_SCALE - 1];
+				}
+			}
+			//? if <26.1 {
+			return target.getPath().equals("default") && target.getNamespace().equals("minecraft") ? remap(StyleSpriteSource.DEFAULT)
+					: remap(new StyleSpriteSource.Font(target));
+			//?} else {
+			/*return target.getPath().equals("default") && target.getNamespace().equals("minecraft") ? remap(FontDescription.DEFAULT)
+					: remap(new FontDescription.Resource(target));
+			*///?}
+		}
+		return switch (id.getPath()) {
+			case "body", "ui" -> UI[hudScaleIndex()];
+			case "tile", "ui_bold" -> UI_BOLD[hudScaleIndex()];
+			case "title" -> TITLE[scaleIndex()];
+			case "big" -> BIG[scaleIndex()];
+			case "display" -> DISPLAY[scaleIndex()];
+			case "display_sm" -> DISPLAY_SM[scaleIndex()];
+			case "display_lg" -> DISPLAY_LG[scaleIndex()];
+			case "hero" -> HERO[scaleIndex()];
+			case "ui_sm" -> UI_SM[scaleIndex()];
+			case "mono" -> MONO[scaleIndex()];
+			default -> id.getPath().startsWith("hud_") && !Character.isDigit(id.getPath().charAt(id.getPath().length() - 1))
+					? HUD.computeIfAbsent(id.getPath(), VeloFonts::hudFonts)[hudScaleIndex()] : fallback;
+		};
+	}
+}

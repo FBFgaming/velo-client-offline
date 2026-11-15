@@ -1,0 +1,27 @@
+name: VeloBridge
+version: '${version}'
+main: net.veloclient.bridge.VeloBridgePlugin
+api-version: '1.20'
+folia-supported: true
+author: Velo Client
+website: https://dev.velo-client.com
+description: Talk to Velo Client players - mod hints, teammates, waypoints, native UI, transfers and more.
+commands:
+  velobridge:
+    description: Velo Bridge admin commands
+    aliases: [vb]
+    usage: /velobridge help
+    permission: velobridge.admin
+  velomenu:
+    description: Open a Velo Bridge menu from config.yml
+    usage: /velomenu <id>
+permissions:
+  velobridge.admin:
+    description: Use /velobridge
+    default: op
+  velobridge.notify:
+    description: Get the Velo join lines switched on under "notify" in config.yml
+    default: op
+  velobridge.notes.manage:
+    description: Change and remove anyone's server-wide World Notes (in Velo)
+    default: op

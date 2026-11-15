@@ -1,0 +1,142 @@
+package net.veloclient.server;
+
+import com.sun.net.httpserver.HttpServer;
+
+import java.util.LinkedHashMap;
+import java.util.Map;
+
+/**
+ * Read-only numbers for the owner panel (panel.velo-client.com): usage stats, live sessions, known players and the
+ * Store's money. Admin token only ({@code X-Velo-Admin-Token}) - the panel's backend holds the token, the browser
+ * never sees it.
+ */
+final class PanelRoutes {
+
+	private PanelRoutes() {
+	}
+
+	/**
+	 * TikTok / YouTube Shorts / Instagram Reels tracking: GET the numbers, POST {"url"} to track, {"remove": key} to stop,
+	 * {"refresh": true} to measure now, {"instagramToken": "..."} to connect Instagram ("" disconnects).
+	 */
+	static void registerSocials(HttpServer server, SocialStatsService socials, String adminToken) {
+		admin(server, adminToken, "/v1/admin/panel/socials", ex -> JsonHttp.writeJson(ex, 200, socials.summary()), "GET");
+		admin(server, adminToken, "/v1/admin/panel/socials/edit", ex -> {
+			var body = com.google.gson.JsonParser.parseString(new String(JsonHttp.readRawBody(ex, 8192), java.nio.charset.StandardCharsets.UTF_8))
+					.getAsJsonObject();
+			if (body.has("remove")) {
+				JsonHttp.writeJson(ex, 200, socials.remove(body.get("remove").getAsString()));
+			} else if (body.has("instagramLogin")) {
+				JsonHttp.writeJson(ex, 200, socials.instagramLoginUrl());
+			} else if (body.has("instagramToken")) {
+				JsonHttp.writeJson(ex, 200, socials.connectInstagram(body.get("instagramToken").getAsString()));
+			} else if (body.has("refresh")) {
+				socials.refreshSoon();
+				JsonHttp.writeJson(ex, 200, socials.summary());
+			} else {
+				JsonHttp.writeJson(ex, 200, socials.add(body.has("url") ? body.get("url").getAsString() : null));
+			}
+		}, "POST");
+		// Instagram's OAuth redirect (public: guarded by the one-time state the panel got above).
+		server.createContext("/v1/instagram/callback", exchange -> VeloServerApp.handle(exchange, "GET", ex -> {
+			Map<String, String> q = StoreRoutes.query(ex);
+			String target = socials.instagramCallback(q.get("code"), q.get("state"), q.getOrDefault("error_description", q.get("error")));
+			ex.getResponseHeaders().set("Location", target);
+			ex.getResponseHeaders().set("Cache-Control", "no-store");
+			ex.sendResponseHeaders(302, -1);
+			ex.close();
+		}));
+	}
+
+	static void register(HttpServer server, SessionRegistry registry, StatsService stats, net.veloclient.server.store.StoreService store, String adminToken) {
+		admin(server, adminToken, "/v1/admin/panel/stats", ex -> {
+			Map<String, String> q = StoreRoutes.query(ex);
+			int days = clamp(q.get("days"), 30, 7, 365);
+			int hours = clamp(q.get("hours"), 48, 1, 24 * 30);
+			Map<String, Object> out = new LinkedHashMap<>(stats.overview(days, hours));
+			int[] live = registry.countsByKind();
+			out.put("onlineNow", Map.of("game", live[0], "launcher", live[1], "web", live[2]));
+			JsonHttp.writeJson(ex, 200, out);
+		});
+		admin(server, adminToken, "/v1/admin/panel/sessions", ex -> JsonHttp.writeJson(ex, 200, Map.of("sessions", registry.liveSessions())));
+		admin(server, adminToken, "/v1/admin/panel/players", ex -> {
+			Map<String, String> q = StoreRoutes.query(ex);
+			JsonHttp.writeJson(ex, 200, Map.of("players", stats.players(clamp(q.get("limit"), 100, 1, 500), q.get("q"))));
+		});
+		admin(server, adminToken, "/v1/admin/panel/store", ex -> {
+			int days = clamp(StoreRoutes.query(ex).get("days"), 30, 7, 365);
+			long now = System.currentTimeMillis();
+			JsonHttp.writeJson(ex, 200, store.database().panelSummary(now - days * 86_400_000L, now, store.ownerUuids(), store.config().plus.price, store.config().plus.yearlyPrice));
+		});
+	}
+
+	/**
+	 * Owner actions on the Store page: {@code store/void} {"orderId"} takes a test payment out (deleted in Tebex - no refund
+	 * webhook comes), {@code store/announce} {"orderId"} or {"plusUuid"} posts a purchase to the donations channel again
+	 * (one that was missed while the webhook didn't work).
+	 */
+	static void registerStoreActions(HttpServer server, net.veloclient.server.store.StoreService store, DiscordAnnouncer announcer, String adminToken) {
+		admin(server, adminToken, "/v1/admin/panel/store/void", ex -> {
+			var body = com.google.gson.JsonParser.parseString(new String(JsonHttp.readRawBody(ex, 4096), java.nio.charset.StandardCharsets.UTF_8)).getAsJsonObject();
+			var order = store.database().voidOrder(body.get("orderId").getAsString());
+			if (order == null) {
+				JsonHttp.writeError(ex, 404, "No such order");
+				return;
+			}
+			System.out.println("[store] Owner voided order " + order.orderId() + " (" + order.coins() + " coins, was " + order.status() + ")");
+			JsonHttp.writeJson(ex, 200, Map.of("ok", true, "wasStatus", order.status(), "coins", order.coins()));
+		}, "POST");
+		admin(server, adminToken, "/v1/admin/panel/store/announce", ex -> {
+			var body = com.google.gson.JsonParser.parseString(new String(JsonHttp.readRawBody(ex, 4096), java.nio.charset.StandardCharsets.UTF_8)).getAsJsonObject();
+			if (!announcer.donationsEnabled()) {
+				JsonHttp.writeError(ex, 409, "The donations webhook isn't set up (VELO_DISCORD_DONATIONS_WEBHOOK)");
+				return;
+			}
+			var db = store.database();
+			if (body.has("orderId")) {
+				var order = db.order(body.get("orderId").getAsString());
+				if (order == null || !"paid".equals(order.status())) {
+					JsonHttp.writeError(ex, 404, "No paid order with that id");
+					return;
+				}
+				announcer.donation(order, db.username(order.uuid()), db.balance(order.uuid()));
+			} else if (body.has("plusUuid")) {
+				String uuid = body.get("plusUuid").getAsString().replace("-", "");
+				announcer.plus(uuid, db.username(uuid));
+			} else {
+				JsonHttp.writeError(ex, 400, "orderId or plusUuid");
+				return;
+			}
+			JsonHttp.writeJson(ex, 200, Map.of("ok", true));
+		}, "POST");
+	}
+
+	private static int clamp(String value, int fallback, int min, int max) {
+		try {
+			return value == null ? fallback : Math.max(min, Math.min(max, Integer.parseInt(value.trim())));
+		} catch (NumberFormatException e) {
+			return fallback;
+		}
+	}
+
+	@FunctionalInterface
+	private interface Handler {
+		void handle(com.sun.net.httpserver.HttpExchange exchange) throws Exception;
+	}
+
+	private static void admin(HttpServer server, String adminToken, String path, Handler handler) {
+		admin(server, adminToken, path, handler, "GET");
+	}
+
+	private static void admin(HttpServer server, String adminToken, String path, Handler handler, String method) {
+		server.createContext(path, exchange -> VeloServerApp.handle(exchange, method, ex -> {
+			String header = ex.getRequestHeaders().getFirst("X-Velo-Admin-Token");
+			if (adminToken == null || header == null || !java.security.MessageDigest.isEqual(
+					adminToken.getBytes(java.nio.charset.StandardCharsets.UTF_8), header.getBytes(java.nio.charset.StandardCharsets.UTF_8))) {
+				JsonHttp.writeError(ex, 403, "Forbidden");
+				return;
+			}
+			handler.handle(ex);
+		}));
+	}
+}

@@ -1,0 +1,453 @@
+package net.veloclient.velo.client;
+
+import net.fabricmc.api.ClientModInitializer;
+import net.veloclient.velo.VeloClient;
+import net.veloclient.velo.client.hud.HudManager;
+import net.veloclient.velo.client.keybind.VeloKeybinds;
+import net.veloclient.velo.client.cosmetics.render.CapeFeatureRenderer;
+import net.veloclient.velo.client.devtools.AnticheatTestController;
+import net.veloclient.velo.client.modules.cosmetics.CapeCosmeticsModule;
+import net.veloclient.velo.client.modules.cosmetics.KillEffectsModule;
+import net.veloclient.velo.client.modules.debug.KeybindConflictCheckerModule;
+import net.veloclient.velo.client.modules.debug.LookingAtInspectorModule;
+import net.veloclient.velo.client.modules.debug.ModuleProfilerOverlayModule;
+import net.veloclient.velo.client.modules.debug.ResourceReloadHotkeyModule;
+import net.veloclient.velo.client.modules.hud.ActionBarLogModule;
+import net.veloclient.velo.client.modules.hud.ArmorDurabilityModule;
+import net.veloclient.velo.client.modules.hud.ClockModule;
+import net.veloclient.velo.client.modules.hud.CoordinatesModule;
+import net.veloclient.velo.client.modules.hud.FpsCounterModule;
+import net.veloclient.velo.client.modules.hud.HeldItemModule;
+import net.veloclient.velo.client.modules.hud.KeystrokesModule;
+import net.veloclient.velo.client.modules.hud.MinimapModule;
+import net.veloclient.velo.client.modules.hud.MouseButtonsModule;
+import net.veloclient.velo.client.modules.hud.PingDisplayModule;
+import net.veloclient.velo.client.modules.hud.PotionTimersModule;
+import net.veloclient.velo.client.modules.hud.ScoreboardHudModule;
+import net.veloclient.velo.client.modules.hud.SessionStatsModule;
+import net.veloclient.velo.client.modules.hud.WaypointsModule;
+import net.veloclient.velo.client.modules.performance.FovModule;
+import net.veloclient.velo.client.modules.performance.FrameTimeGraphModule;
+import net.veloclient.velo.client.modules.performance.FullBrightModule;
+import net.veloclient.velo.client.modules.performance.GpuUtilizationModule;
+import net.veloclient.velo.client.modules.performance.InputSamplerModule;
+import net.veloclient.velo.client.modules.performance.MemoryMonitorModule;
+import net.veloclient.velo.client.modules.performance.ParticleLimiterModule;
+import net.veloclient.velo.client.modules.performance.PerformanceBoostModule;
+import net.veloclient.velo.client.modules.rendering.MotionBlurModule;
+import net.veloclient.velo.client.modules.performance.RenderCullingModule;
+import net.veloclient.velo.client.modules.qol.CustomCrosshairModule;
+import net.veloclient.velo.client.modules.qol.FreeLookModule;
+import net.veloclient.velo.client.modules.qol.NickHiderModule;
+import net.veloclient.velo.client.modules.qol.SmallCapsModule;
+import net.veloclient.velo.client.modules.qol.ToggleSneakModule;
+import net.veloclient.velo.client.modules.qol.ToggleSprintModule;
+import net.veloclient.velo.client.modules.qol.ZoomModule;
+import net.veloclient.velo.client.modules.queue.BackgroundQueueModule;
+import net.veloclient.velo.client.modules.rendering.BlockOutlineModule;
+import net.veloclient.velo.client.modules.rendering.TimeWeatherFogModule;
+import net.veloclient.velo.client.modules.rendering.TntTimerModule;
+import net.veloclient.velo.client.modules.servertools.ChunkBorderOverlayModule;
+import net.veloclient.velo.client.modules.servertools.ChunkLoadProfilerModule;
+import net.veloclient.velo.client.modules.servertools.ClientLogViewerModule;
+import net.veloclient.velo.client.modules.servertools.EntityCountOverlayModule;
+import net.veloclient.velo.client.modules.servertools.HitboxVisualizerModule;
+import net.veloclient.velo.client.modules.servertools.LightLevelOverlayModule;
+import net.veloclient.velo.client.modules.servertools.PacketTrafficMonitorModule;
+import net.veloclient.velo.client.modules.servertools.ParticleDebugOverlayModule;
+import net.veloclient.velo.client.modules.servertools.TpsTickGraphModule;
+import net.veloclient.velo.client.modules.servertools.WorldBorderVisualizerModule;
+import net.veloclient.velo.client.modules.utility.AutoReconnectModule;
+import net.veloclient.velo.client.modules.utility.CommandKeybindsModule;
+import net.veloclient.velo.client.modules.utility.CopyCoordinatesModule;
+import net.veloclient.velo.client.modules.utility.SessionAutoFixerModule;
+import net.veloclient.velo.client.modules.utility.VeloNetworkModule;
+import net.veloclient.velo.module.ModuleRegistry;
+
+/** Client-only entrypoint: registers every built-in module, the keybind and the HUD renderer. */
+public final class VeloClientMod implements ClientModInitializer {
+
+	@Override
+	public void onInitializeClient() {
+		// Cosmetics are per Minecraft account: the Velo launcher says which (-Dvelo.account), other launchers via --uuid.
+		if (net.veloclient.velo.config.VeloPaths.account() == null) {
+			String[] args = net.fabricmc.loader.api.FabricLoader.getInstance().getLaunchArguments(false);
+			for (int i = 0; i + 1 < args.length; i++) {
+				if ("--uuid".equals(args[i])) {
+					net.veloclient.velo.config.VeloPaths.setAccount(args[i + 1]);
+				}
+			}
+		}
+		// A Cloud Sync restore waiting for this start goes in before anything reads its settings.
+		net.veloclient.velo.client.cloud.CloudSync.applyPendingAtStartup();
+		// Dedicated GPUs on "Default" (= OpenGL) move to Vulkan once; undoes itself if that start fails.
+		net.veloclient.velo.client.modules.performance.AutoVulkan.beforeOptionsLoad();
+		net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientLifecycleEvents.CLIENT_STARTED.register(
+				client -> net.veloclient.velo.client.modules.performance.AutoVulkan.onStarted());
+		net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientTickEvents.END_CLIENT_TICK.register(
+				client -> net.veloclient.velo.client.cloud.CloudSync.tick());
+		net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientTickEvents.END_CLIENT_TICK.register(
+				net.veloclient.velo.client.devtools.StartupTimer::tick);
+		net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientTickEvents.END_CLIENT_TICK.register(
+				client -> net.veloclient.velo.client.cosmetics.LockerFileSync.tick());
+		net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientLifecycleEvents.CLIENT_STOPPING.register(
+				client -> net.veloclient.velo.client.cloud.CloudSync.onStop());
+		// The launcher's Stop / Relaunch asks the game to close instead of killing it (saves the world).
+		net.veloclient.velo.client.util.CloseRequest.register();
+		// Your real ping (tab list row, Ping HUD) - servers often send fake per-player pings.
+		net.veloclient.velo.client.util.OwnPing.register();
+		// Before any profile loads: saved keybinds convert between GLFW (<26.3) and SDL (26.3+) codes.
+		net.veloclient.velo.profile.ModuleStateStore.currentKeyFormat = net.veloclient.velo.client.util.Keys.format();
+		net.veloclient.velo.profile.ModuleStateStore.keyConverter = net.veloclient.velo.client.util.Keys::convert;
+		//? if <1.21.11 {
+		/*net.veloclient.velo.client.render.gizmo.GizmoDrawing.init();
+		*///?}
+		// Velo is the mod list: mods' Mod Menu settings screens load without Mod Menu installed.
+		net.veloclient.velo.client.mods.ModMenuApiShim.install();
+		registerModules();
+		loadAddons();
+		HudManager.register();
+		net.veloclient.velo.client.sound.VeloUiSounds.register();
+		VeloKeybinds.register();
+		net.veloclient.velo.client.keybind.MenuKeySync.register();
+		net.veloclient.velo.client.util.ClassWarmup.register();
+		net.veloclient.velo.client.util.MemoryStatsRecorder.start();
+		CapeFeatureRenderer.register();
+		net.veloclient.velo.client.cosmetics.render.WingsFeatureRenderer.register();
+		net.veloclient.velo.client.cosmetics.render.WearFeatureRenderer.register();
+		net.veloclient.velo.client.cosmetics.render.AuraFeatureRenderer.register();
+		net.veloclient.velo.client.cosmetics.render.EmoteFxRenderer.register();
+		net.veloclient.velo.client.cosmetics.render.KillFxRenderer.register();
+		net.veloclient.velo.client.network.RewardsReporter.register();
+		registerSocialOverlay();
+		net.veloclient.velo.client.social.PartyFollow.register();
+		net.veloclient.velo.client.social.PartyVoice.register();
+		net.veloclient.velo.client.social.PartyCommand.register();
+		net.veloclient.velo.client.social.VeloCommands.register();
+		net.veloclient.velo.client.gui.title.LastServer.register();
+		net.veloclient.velo.client.stats.PlayTimeDays.register();
+		net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientTickEvents.END_CLIENT_TICK.register(
+				client -> {
+					net.veloclient.velo.client.cosmetics.AnimatedCapeAsset.tickAll();
+					net.veloclient.velo.client.cosmetics.GazeCapes.tick();
+				});
+		net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientTickEvents.END_CLIENT_TICK.register(
+				net.veloclient.velo.client.gui.RemoteTextureLoader::tick);
+		net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientTickEvents.END_CLIENT_TICK.register(
+				net.veloclient.velo.client.util.HeapPressureGuard::tick);
+		// PvP trackers and Anti Farm Lag (each does nothing while its modules are off).
+		net.veloclient.velo.client.pvp.CombatTracker.register();
+		net.veloclient.velo.client.pvp.FightTracker.register();
+		net.veloclient.velo.client.clips.AutoClips.register();
+		net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientTickEvents.END_CLIENT_TICK.register(
+				client -> net.veloclient.velo.client.hosting.WorldHosting.tickPending());
+		net.fabricmc.fabric.api.client.networking.v1.ClientPlayConnectionEvents.DISCONNECT.register(
+				(handler, client) -> net.veloclient.velo.client.hosting.WorldHosting.onWorldLeft());
+		net.veloclient.velo.client.serverpacks.GameSession.register();
+		net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientTickEvents.START_CLIENT_TICK.register(
+				client -> net.veloclient.velo.client.modules.pvp.OldAnimationsModule.tick());
+		net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientTickEvents.END_CLIENT_TICK.register(client -> {
+			net.veloclient.velo.client.pvp.CombatTracker.tick();
+			net.veloclient.velo.client.pvp.FightTracker.tick();
+			net.veloclient.velo.client.serverpacks.GameSession.get().tick(net.veloclient.velo.client.modules.hud.ServerOverlaysModule.active());
+			net.veloclient.velo.client.pvp.EnemyTracker.tick();
+			net.veloclient.velo.client.pvp.TotemPopTracker.tick();
+			net.veloclient.velo.client.modules.performance.AntiFarmLagModule.tickAll();
+			net.veloclient.velo.client.modules.pvp.HitColorModule.tickAll();
+			net.veloclient.velo.client.modules.debug.BetterF3Module.tickShortcuts();
+			net.veloclient.velo.client.modules.pvp.DamageNumbersModule.tickAll();
+			net.veloclient.velo.client.pvp.ServerHealth.tick();
+			net.veloclient.velo.client.worldmap.PartyLocator.tick();
+			net.veloclient.velo.client.social.PartyFollow.tick();
+			net.veloclient.velo.client.social.PartyVoice.tick();
+		});
+		net.veloclient.velo.client.profile.VeloProfileStore.loadActiveDeferred();
+		// Previously only loaded lazily the first time the Crosshair select
+		// screen was opened, so the persisted "equipped" crosshair never
+		// actually rendered on a fresh launch - CustomCrosshairModule reads
+		// CrosshairManager.equipped() every frame, which stayed null until
+		// then, until the user opened that screen (which happened to load
+		// it) at least once.
+		net.veloclient.velo.client.crosshair.CrosshairManager.loadLibrary();
+		ModuleRegistry.exportManifest();
+		AnticheatTestController.initIfEnabled();
+		net.veloclient.velo.client.devtools.ScreenshotTour.initIfRequested();
+		net.veloclient.velo.client.devtools.CosmeticsBench.register();
+		net.veloclient.velo.client.devtools.CrowdBench.register();
+		net.veloclient.velo.client.devtools.MoveBench.register();
+		net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientTickEvents.END_CLIENT_TICK.register(
+				net.veloclient.velo.client.modules.performance.HudCacheTuner::tick);
+		net.veloclient.velo.client.devtools.FarmBench.register();
+		net.veloclient.velo.client.devtools.ItemBench.register();
+		VeloClient.LOGGER.info("Velo Client ready ({} modules registered)", ModuleRegistry.all().size());
+	}
+
+	/**
+	 * Runs every installed add-on (see {@link net.veloclient.velo.client.addon.VeloAddon}) - e.g.
+	 * the optional "Velo Client Addons" jar with the experimental modules. Before the profile loads,
+	 * so their saved state restores like any built-in module's. One broken add-on is logged and
+	 * skipped rather than taking the client down with it.
+	 */
+	private void loadAddons() {
+		// The features that started in the dev build (pets, notes, storage, bridge...) register here, like an add-on.
+		try {
+			Class.forName("net.veloclient.velo.dev.VeloDev").asSubclass(net.veloclient.velo.client.addon.VeloAddon.class)
+					.getDeclaredConstructor().newInstance().onVeloInitialize();
+			VeloClient.LOGGER.info("Loaded the Velo Client feature modules");
+		} catch (ClassNotFoundException missing) {
+			// not packed (a stripped-down build)
+		} catch (Throwable t) {
+			VeloClient.LOGGER.error("Velo Client feature modules failed to initialize", t);
+		}
+		// Dev builds only (src/dev): features that aren't released yet.
+		try {
+			Class.forName("net.veloclient.velo.preview.VeloPreview").asSubclass(net.veloclient.velo.client.addon.VeloAddon.class)
+					.getDeclaredConstructor().newInstance().onVeloInitialize();
+			VeloClient.LOGGER.info("Loaded the guide, menu and interface sound features");
+		} catch (ClassNotFoundException missing) {
+			// a release build
+		} catch (Throwable t) {
+			VeloClient.LOGGER.error("Preview features failed to initialize", t);
+		}
+		for (var container : net.fabricmc.loader.api.FabricLoader.getInstance()
+				.getEntrypointContainers(net.veloclient.velo.client.addon.VeloAddon.ENTRYPOINT, net.veloclient.velo.client.addon.VeloAddon.class)) {
+			try {
+				container.getEntrypoint().onVeloInitialize();
+				VeloClient.LOGGER.info("Loaded Velo add-on {}", container.getProvider().getMetadata().getId());
+			} catch (Throwable t) {
+				VeloClient.LOGGER.error("Velo add-on {} failed to initialize", container.getProvider().getMetadata().getId(), t);
+			}
+		}
+	}
+
+	/**
+	 * Friend popups: drawn on the HUD while playing (see HudManager) and on top of every screen,
+	 * where the mouse is free so they can be clicked - a click that lands on a popup is consumed
+	 * before the screen underneath sees it.
+	 */
+	/** Options > Skin Customization gets a "Velo Skins" button (manage and switch skins). */
+	private static void addSkinsButton(net.minecraft.client.gui.screen.Screen screen, int width) {
+		//? if <26.1 {
+		boolean skinOptions = screen instanceof net.minecraft.client.gui.screen.option.SkinOptionsScreen;
+		//?} else {
+		/*boolean skinOptions = screen instanceof net.minecraft.client.gui.screens.options.SkinCustomizationScreen;
+		*///?}
+		if (!skinOptions) {
+			return;
+		}
+		var button = new net.veloclient.velo.client.gui.widget.VeloButton(width - 112, 6, 106, 20, net.minecraft.text.Text.literal("Velo Skins  >"),
+				b -> net.minecraft.client.MinecraftClient.getInstance().setScreen(new net.veloclient.velo.client.gui.VeloSkinsScreen(screen))).primary();
+		//? if <26.1 {
+		net.fabricmc.fabric.api.client.screen.v1.Screens.getButtons(screen).add(button);
+		//?} else {
+		/*net.fabricmc.fabric.api.client.screen.v1.Screens.getWidgets(screen).add(button);
+		*///?}
+	}
+
+	/** First title screen after a crash: offer to send the crash report. */
+	private static void offerCrashReport(net.minecraft.client.MinecraftClient client, net.minecraft.client.gui.screen.Screen screen) {
+		if (!(screen instanceof net.minecraft.client.gui.screen.TitleScreen)) {
+			return;
+		}
+		java.nio.file.Path crash = net.veloclient.velo.client.report.CrashCheck.pendingCrash();
+		if (crash != null) {
+			client.execute(() -> client.setScreen(new net.veloclient.velo.client.gui.BugReportScreen(screen, crash)));
+		}
+	}
+
+	private void registerSocialOverlay() {
+		net.veloclient.velo.client.social.SocialNotifications.register();
+		// Velo's Statistics and Controls screens replace vanilla's.
+		net.fabricmc.fabric.api.client.screen.v1.ScreenEvents.AFTER_INIT.register((client, screen, scaledWidth, scaledHeight) -> {
+			net.veloclient.velo.client.gui.VeloStatsScreen.maybeReplace(client, screen);
+			net.veloclient.velo.client.gui.VeloKeybindsScreen.maybeReplace(client, screen);
+			net.veloclient.velo.client.gui.VeloAdvancementsScreen.maybeReplace(client, screen);
+			net.veloclient.velo.client.gui.packs.VeloPacksScreen.maybeReplace(client, screen);
+			addSkinsButton(screen, scaledWidth);
+			offerCrashReport(client, screen);
+		});
+		net.fabricmc.fabric.api.client.screen.v1.ScreenEvents.AFTER_INIT.register((client, screen, scaledWidth, scaledHeight) -> {
+			net.fabricmc.fabric.api.client.screen.v1.ScreenEvents.afterRender(screen).register((s, context, mouseX, mouseY, tickDelta) -> {
+				net.veloclient.velo.client.modules.qol.ShulkerPreview.render(s, context, mouseX, mouseY);
+				net.veloclient.velo.client.social.NotificationOverlay.renderOverScreen(s, context, mouseX, mouseY);
+			});
+			//? if <1.21.2 {
+			/*net.fabricmc.fabric.api.client.screen.v1.ScreenMouseEvents.allowMouseClick(screen).register((s, x, y, button) ->
+					!net.veloclient.velo.client.modules.qol.ShulkerPreview.click(s, x, y, button));
+			net.fabricmc.fabric.api.client.screen.v1.ScreenKeyboardEvents.allowKeyPress(screen).register((s, key, scancode, modifiers) ->
+					!(key == net.veloclient.velo.client.util.Keys.ESCAPE && net.veloclient.velo.client.modules.qol.ShulkerPreview.escape(s)));
+			net.fabricmc.fabric.api.client.screen.v1.ScreenMouseEvents.allowMouseClick(screen).register((s, x, y, button) ->
+					!net.veloclient.velo.client.social.NotificationOverlay.click(x, y));
+			*///?} else {
+			net.fabricmc.fabric.api.client.screen.v1.ScreenMouseEvents.allowMouseClick(screen).register((s, click) ->
+					!net.veloclient.velo.client.modules.qol.ShulkerPreview.click(s, click.x(), click.y(), click.button()));
+			net.fabricmc.fabric.api.client.screen.v1.ScreenKeyboardEvents.allowKeyPress(screen).register((s, key) ->
+					!(key.key() == net.veloclient.velo.client.util.Keys.ESCAPE && net.veloclient.velo.client.modules.qol.ShulkerPreview.escape(s)));
+			net.fabricmc.fabric.api.client.screen.v1.ScreenMouseEvents.allowMouseClick(screen).register((s, click) ->
+					!net.veloclient.velo.client.social.NotificationOverlay.click(click.x(), click.y()));
+			//?}
+		});
+	}
+
+	private void registerModules() {
+		// PvP
+		ModuleRegistry.register(new net.veloclient.velo.client.modules.pvp.OldAnimationsModule());
+		ModuleRegistry.register(new net.veloclient.velo.client.modules.pvp.ItemPositionModule());
+		ModuleRegistry.register(new net.veloclient.velo.client.modules.rendering.HoldUpItemsModule());
+		ModuleRegistry.register(new net.veloclient.velo.client.modules.rendering.ParticleSizeModule());
+		ModuleRegistry.register(new net.veloclient.velo.client.modules.rendering.ColorGradingModule());
+		ModuleRegistry.register(new net.veloclient.velo.client.modules.pvp.HitColorModule());
+		ModuleRegistry.register(new net.veloclient.velo.client.modules.pvp.HitParticlesModule());
+		ModuleRegistry.register(new net.veloclient.velo.client.modules.pvp.CooldownsModule());
+		ModuleRegistry.register(new net.veloclient.velo.client.modules.pvp.HealthIndicatorModule());
+		ModuleRegistry.register(new net.veloclient.velo.client.modules.pvp.EnemyEffectsModule());
+		ModuleRegistry.register(new net.veloclient.velo.client.modules.pvp.EnemyHungerModule());
+		ModuleRegistry.register(new net.veloclient.velo.client.modules.pvp.TargetHudModule());
+		ModuleRegistry.register(new net.veloclient.velo.client.modules.pvp.ComboCounterModule());
+		ModuleRegistry.register(new net.veloclient.velo.client.modules.pvp.ReachDisplayModule());
+		ModuleRegistry.register(new net.veloclient.velo.client.modules.pvp.PotCounterModule());
+		ModuleRegistry.register(new net.veloclient.velo.client.modules.pvp.DamageNumbersModule());
+		ModuleRegistry.register(new net.veloclient.velo.client.modules.pvp.HitSoundsModule());
+		ModuleRegistry.register(new net.veloclient.velo.client.modules.pvp.AutoGgModule());
+		ModuleRegistry.register(new net.veloclient.velo.client.modules.pvp.HeightLimitModule());
+		ModuleRegistry.register(new net.veloclient.velo.client.modules.pvp.SpeedHudModule());
+		ModuleRegistry.register(new net.veloclient.velo.client.modules.pvp.DirectionHudModule());
+		ModuleRegistry.register(new net.veloclient.velo.client.modules.pvp.ArrowCounterModule());
+		ModuleRegistry.register(new net.veloclient.velo.client.modules.pvp.LowHealthWarningModule());
+		ModuleRegistry.register(new net.veloclient.velo.client.modules.pvp.LowFireModule());
+		ModuleRegistry.register(new net.veloclient.velo.client.modules.pvp.FightRecapModule());
+		ModuleRegistry.register(new net.veloclient.velo.client.modules.qol.ClipsModule());
+		ModuleRegistry.register(new net.veloclient.velo.client.modules.qol.PartyPingModule());
+		ModuleRegistry.register(new net.veloclient.velo.client.modules.qol.ChatTweaksModule());
+		ModuleRegistry.register(new net.veloclient.velo.client.modules.redstone.HopperSpeedModule());
+		ModuleRegistry.register(new net.veloclient.velo.client.modules.redstone.FastGrowModule());
+		ModuleRegistry.register(new net.veloclient.velo.client.modules.qol.FlySpeedModule());
+		ModuleRegistry.register(new net.veloclient.velo.client.modules.qol.PhantomModule());
+		net.veloclient.velo.client.redstone.RedstoneMode.init();
+		ModuleRegistry.register(new net.veloclient.velo.client.modules.hud.ServerOverlaysModule());
+		ModuleRegistry.register(new net.veloclient.velo.client.modules.hud.PlayerLevelsModule());
+		ModuleRegistry.register(new net.veloclient.velo.client.modules.servertools.GameModePresetsModule());
+		// HUD / QoL (section 6.2)
+		ModuleRegistry.register(new net.veloclient.velo.client.modules.hud.HudStyleModule());
+		ModuleRegistry.register(new net.veloclient.velo.client.modules.cosmetics.WingsCosmeticsModule());
+		ModuleRegistry.register(new net.veloclient.velo.client.modules.cosmetics.AuraCosmeticsModule());
+		ModuleRegistry.register(new FpsCounterModule());
+		ModuleRegistry.register(new PingDisplayModule());
+		ModuleRegistry.register(new CoordinatesModule());
+		ModuleRegistry.register(new ClockModule());
+		ModuleRegistry.register(new net.veloclient.velo.client.modules.hud.MediaPlayerModule());
+		ModuleRegistry.register(new ArmorDurabilityModule());
+		ModuleRegistry.register(new PotionTimersModule());
+		ModuleRegistry.register(new HeldItemModule());
+		ModuleRegistry.register(new net.veloclient.velo.client.modules.hud.TotemCounterModule());
+		ModuleRegistry.register(new net.veloclient.velo.client.modules.hud.InventoryHudModule());
+		ModuleRegistry.register(new net.veloclient.velo.client.modules.hud.MiniPlayerModule());
+		ModuleRegistry.register(new net.veloclient.velo.client.modules.hud.ModuleListModule());
+		ModuleRegistry.register(new net.veloclient.velo.client.modules.hud.ServerDisplayModule());
+		ModuleRegistry.register(new net.veloclient.velo.client.modules.hud.CustomLinesModule());
+		ModuleRegistry.register(new net.veloclient.velo.client.modules.hud.CustomImageModule());
+		ModuleRegistry.register(new net.veloclient.velo.client.youtube.YouTubeModule());
+		ModuleRegistry.register(new net.veloclient.velo.client.lyrics.LyricsModule());
+		ModuleRegistry.register(new net.veloclient.velo.client.modules.pvp.TotemPopsModule());
+		ModuleRegistry.register(new KeystrokesModule());
+		ModuleRegistry.register(new MouseButtonsModule());
+		net.veloclient.velo.client.worldmap.WorldMap.register();
+		net.veloclient.velo.client.worldmap.WorldMapKeys.register();
+		ModuleRegistry.register(new net.veloclient.velo.client.worldmap.WorldMapModule());
+		ModuleRegistry.register(new net.veloclient.velo.client.modules.hud.HeartsModule());
+		ModuleRegistry.register(new net.veloclient.velo.client.modules.hud.HungerModule());
+		net.veloclient.velo.client.util.AppleSkinCompat.vetoFoodOverlays(net.veloclient.velo.client.modules.hud.HungerModule::ownsFoodOverlay);
+		ModuleRegistry.register(new net.veloclient.velo.client.modules.hud.ArmorBarModule());
+		ModuleRegistry.register(new net.veloclient.velo.client.modules.hud.XpBarModule());
+		ModuleRegistry.register(new net.veloclient.velo.client.modules.hud.HotbarModule());
+		ModuleRegistry.register(new ActionBarLogModule());
+		ModuleRegistry.register(new SessionStatsModule());
+		ModuleRegistry.register(new WaypointsModule());
+		ModuleRegistry.register(new ScoreboardHudModule());
+		ModuleRegistry.register(new net.veloclient.velo.client.modules.hud.BossBarModule());
+		ModuleRegistry.register(new net.veloclient.velo.client.modules.qol.ShulkerPreviewModule());
+		ModuleRegistry.register(new net.veloclient.velo.client.modules.qol.OwnNameTagModule());
+		ModuleRegistry.register(new net.veloclient.velo.client.modules.debug.BetterF3Module());
+		ModuleRegistry.register(new net.veloclient.velo.client.modules.servertools.SpawnRadiusModule());
+		ModuleRegistry.register(new net.veloclient.velo.client.modules.servertools.SimulationDistanceModule());
+		ModuleRegistry.register(new ToggleSprintModule());
+		ModuleRegistry.register(new ToggleSneakModule());
+		ModuleRegistry.register(new ZoomModule());
+		ModuleRegistry.register(new net.veloclient.velo.client.modules.qol.CenteredInventoryModule());
+		ModuleRegistry.register(new net.veloclient.velo.client.modules.performance.C2meModule());
+		ModuleRegistry.register(new net.veloclient.velo.client.modules.performance.AlternateCurrentModule());
+		ModuleRegistry.register(new net.veloclient.velo.client.modules.performance.CosmeticsQualityModule());
+		ModuleRegistry.register(new CustomCrosshairModule());
+		ModuleRegistry.register(new net.veloclient.velo.client.modules.qol.AttackIndicatorModule());
+		ModuleRegistry.register(new MinimapModule());
+		ModuleRegistry.register(new FreeLookModule());
+		ModuleRegistry.register(new NickHiderModule());
+		ModuleRegistry.register(new SmallCapsModule());
+		ModuleRegistry.register(new net.veloclient.velo.client.modules.qol.FriendsModule());
+		ModuleRegistry.register(new net.veloclient.velo.client.modules.qol.EmojiChatModule());
+		ModuleRegistry.register(new net.veloclient.velo.client.modules.rendering.HideFoliageModule());
+		ModuleRegistry.register(new net.veloclient.velo.client.modules.rendering.NoBreakParticlesModule());
+		ModuleRegistry.register(new net.veloclient.velo.client.modules.rendering.AntiDeepslateModule());
+		ModuleRegistry.register(new net.veloclient.velo.client.modules.qol.AntiCoordsLeakModule());
+		ModuleRegistry.register(new net.veloclient.velo.client.modules.performance.SeamlessReloadModule());
+		ModuleRegistry.register(new net.veloclient.velo.client.modules.qol.VeloLoadingScreenModule());
+		ModuleRegistry.register(new net.veloclient.velo.client.modules.rendering.ContainerAnimationsModule());
+		//? if >=26.2 {
+		/*ModuleRegistry.register(new net.veloclient.velo.client.modules.rendering.VeloShadersModule());
+		net.veloclient.velo.client.modules.rendering.VeloShadersModule.registerPack();
+		*///?}
+
+		// Rendering
+		ModuleRegistry.register(new TntTimerModule());
+		ModuleRegistry.register(new BlockOutlineModule());
+		ModuleRegistry.register(new TimeWeatherFogModule());
+
+		// Cosmetics (section 6.5)
+		ModuleRegistry.register(new CapeCosmeticsModule());
+		ModuleRegistry.register(new KillEffectsModule());
+		ModuleRegistry.register(new net.veloclient.velo.client.modules.cosmetics.EmotesModule());
+		ModuleRegistry.register(new VeloNetworkModule());
+
+		// Performance (section 6.1)
+		ModuleRegistry.register(new FrameTimeGraphModule());
+		ModuleRegistry.register(new MemoryMonitorModule());
+		ModuleRegistry.register(new GpuUtilizationModule());
+		ModuleRegistry.register(new ParticleLimiterModule());
+		ModuleRegistry.register(new net.veloclient.velo.client.modules.performance.AntiFarmLagModule());
+		ModuleRegistry.register(new net.veloclient.velo.client.modules.performance.TntOptimizerModule());
+		ModuleRegistry.register(new PerformanceBoostModule());
+		ModuleRegistry.register(new RenderCullingModule());
+		ModuleRegistry.register(new net.veloclient.velo.client.modules.performance.ShaderCacheModule());
+		ModuleRegistry.register(new net.veloclient.velo.client.modules.performance.EntityDetailModule());
+		ModuleRegistry.register(new MotionBlurModule());
+		ModuleRegistry.register(new FullBrightModule());
+		ModuleRegistry.register(new FovModule());
+		ModuleRegistry.register(new net.veloclient.velo.client.modules.rendering.ScreenStretchModule());
+		ModuleRegistry.register(new InputSamplerModule());
+
+		// Utility
+		ModuleRegistry.register(new CopyCoordinatesModule());
+		ModuleRegistry.register(new CommandKeybindsModule());
+		ModuleRegistry.register(new AutoReconnectModule());
+		ModuleRegistry.register(new SessionAutoFixerModule());
+
+		// Server Tools (section 6.3)
+		ModuleRegistry.register(new EntityCountOverlayModule());
+		ModuleRegistry.register(new ChunkBorderOverlayModule());
+		ModuleRegistry.register(new ChunkLoadProfilerModule());
+		ModuleRegistry.register(new HitboxVisualizerModule());
+		ModuleRegistry.register(new WorldBorderVisualizerModule());
+		ModuleRegistry.register(new LightLevelOverlayModule());
+		ModuleRegistry.register(new TpsTickGraphModule());
+		ModuleRegistry.register(new PacketTrafficMonitorModule());
+		ModuleRegistry.register(new ParticleDebugOverlayModule());
+		ModuleRegistry.register(new ClientLogViewerModule());
+		ModuleRegistry.register(new BackgroundQueueModule());
+
+		// Debug (section 6.4)
+		ModuleRegistry.register(new ResourceReloadHotkeyModule());
+		ModuleRegistry.register(new KeybindConflictCheckerModule());
+		ModuleRegistry.register(new LookingAtInspectorModule());
+		ModuleRegistry.register(new ModuleProfilerOverlayModule());
+	}
+}

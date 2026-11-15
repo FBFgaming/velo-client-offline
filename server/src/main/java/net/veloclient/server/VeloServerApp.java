@@ -1,0 +1,745 @@
+package net.veloclient.server;
+
+import com.sun.net.httpserver.HttpExchange;
+import com.sun.net.httpserver.HttpServer;
+
+import java.io.IOException;
+import java.net.InetSocketAddress;
+import java.nio.file.Path;
+import java.util.List;
+import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
+
+/**
+ * The Velo Client community server: the small piece of shared state that
+ * lets players running Velo Client see the badge next to *each other's*
+ * names (not just their own, which is purely local - see
+ * {@code VeloBadge}'s doc) and each other's equipped cosmetic cape, since
+ * neither of those can work across players without something they all talk
+ * to. See server/README.md for what this does/doesn't do and how to run it.
+ *
+ * <p>Deliberately minimal: everything lives in memory ({@link
+ * SessionRegistry}), identity is proven via the same join/hasJoined
+ * handshake vanilla servers use ({@link MojangSessionVerifier}) so this
+ * process never has to see anyone's real access token, and there's exactly
+ * one thing being tracked today (who's online + which of the built-in Store
+ * capes they have equipped) - more cosmetics/social features can be added
+ * as new endpoints later without touching this shape.
+ */
+public final class VeloServerApp {
+
+	private static final int DEFAULT_PORT = 8787;
+	private static SocialService social;
+	/** Staff, online-service bans and player reports. */
+	static StaffService staff;
+	private static net.veloclient.server.store.StoreService store;
+	/** Everyone's last in-game look, for players on another client (see LastCosmetics). */
+	private static LastCosmetics lastLooks;
+	/** Installs, daily actives and online samples for the owner panel. */
+	private static StatsService stats;
+	private static OgBadge og;
+	private static PartnerPlayRewards partnerRewards;
+
+	public static void main(String[] args) throws IOException {
+		int port = resolvePort();
+		SessionRegistry registry = new SessionRegistry();
+		Path dataDir = Path.of(envOr("VELO_DATA_DIR", "data")).toAbsolutePath();
+		CapeStore capes = new CapeStore(dataDir);
+		social = new SocialService(dataDir, registry);
+		String adminToken = envOr("VELO_ADMIN_TOKEN", null);
+		try {
+			var storeConfig = net.veloclient.server.store.StoreConfig.load(dataDir);
+			var storeDb = new net.veloclient.server.store.StoreDatabase(dataDir.resolve("store.db"));
+			var tebex = new net.veloclient.server.store.TebexCheckout(envOr("TEBEX_PUBLIC_TOKEN", null),
+					envOr("TEBEX_WEBHOOK_SECRET", envOr("TEBEX_WEBBHOOK_SECRET", null)));
+			store = new net.veloclient.server.store.StoreService(storeConfig, storeDb, tebex,
+					net.veloclient.server.store.StoreService.parseOwners(envOr("VELO_OWNERS", null), VeloServerApp::normalizeUuid),
+					envOr("VELO_PUBLIC_URL", null),
+					new net.veloclient.server.store.StoreService.AdConfig(envOr("AYET_PLACEMENT_ID", null),
+							envOr("AYET_ADSLOT", null), envOr("AYET_API_KEY", null)),
+					query -> {
+						SocialService.PlayerRef ref = social.resolvePlayer(query);
+						return new String[] {ref.uuid(), ref.username()};
+					});
+		} catch (java.sql.SQLException e) {
+			throw new IOException("Couldn't open the store database", e);
+		}
+		// Wings and capes with their art: bundled ones are added when missing, the rest is managed by the owner.
+		var cosmetics = new net.veloclient.server.store.CosmeticsService(dataDir);
+		java.util.Map<String, Integer> oldPrices = new java.util.HashMap<>();
+		store.config().items.forEach(i -> oldPrices.put(i.id(), i.price()));
+		cosmetics.seedFromClasspath("/cosmetics-seed/", oldPrices);
+		store.setCosmetics(cosmetics);
+
+		try {
+			stats = new StatsService(dataDir);
+			og = new OgBadge(stats, Long.parseLong(envOr("VELO_OG_CUTOFF", String.valueOf(OgBadge.DEFAULT_CUTOFF))));
+		} catch (java.sql.SQLException e) {
+			throw new IOException("Couldn't open the stats database", e);
+		}
+
+		// VELO_SERVER_BIND=127.0.0.1 behind nginx, so the plain-HTTP port isn't reachable from outside.
+		String bind = envOr("VELO_SERVER_BIND", null);
+		HttpServer server = HttpServer.create(bind == null ? new InetSocketAddress(port) : new InetSocketAddress(bind, port), 0);
+		server.setExecutor(Executors.newVirtualThreadPerTaskExecutor());
+
+		server.createContext("/v1/health", exchange -> handle(exchange, "GET", ex -> handleHealth(ex, registry)));
+		server.createContext("/v1/session/challenge", exchange -> handle(exchange, "POST", ex -> handleChallenge(ex, registry)));
+		server.createContext("/v1/session/verify", exchange -> handle(exchange, "POST", ex -> handleVerify(ex, registry)));
+		server.createContext("/v1/session/end", exchange -> handle(exchange, "POST", ex -> handleEnd(ex, registry)));
+		server.createContext("/v1/session/end-game", exchange -> handle(exchange, "POST", ex -> handleEndGame(ex, registry)));
+		server.createContext("/v1/heartbeat", exchange -> handle(exchange, "POST", ex -> handleHeartbeat(ex, registry, capes)));
+		server.createContext("/v1/online", exchange -> handle(exchange, "GET", ex -> handleOnline(ex, registry)));
+		// Public live numbers for the launcher's Home ("123 playing now · 1,234 today"): two counts, cached 30 s.
+		server.createContext("/v1/stats/live", exchange -> handle(exchange, "GET", ex -> handleLiveStats(ex, registry)));
+		lastLooks = new LastCosmetics(dataDir);
+		server.createContext("/v1/cosmetics/of", exchange -> handle(exchange, "POST", ex -> handleCosmeticsOf(ex, registry, capes)));
+		server.createContext("/v1/cape/upload", exchange -> handle(exchange, "POST", ex -> handleCapeUpload(ex, registry, capes)));
+		server.createContext("/v1/cape/remove", exchange -> handle(exchange, "POST", ex -> handleCapeRemove(ex, registry, capes)));
+		// GET /v1/cape/<sha256> - the path suffix is the hash (see handleCapeDownload).
+		server.createContext("/v1/cape/", exchange -> handle(exchange, "GET", ex -> handleCapeDownload(ex, capes)));
+		staff = new StaffService(dataDir);
+		SocialRoutes.setBans(staff);
+		SocialRoutes.register(server, registry, social);
+		PartyService parties = new PartyService(social);
+		PartyRoutes.register(server, registry, social, parties);
+		ReportService reportService = new ReportService(dataDir);
+		store.setPartnerCodes(new net.veloclient.server.store.PartnerCodes(dataDir));
+		StoreRoutes.register(server, registry, store, dataDir);
+		StoreRoutes.setPanelOwner(store.firstOwnerUuid());
+		WebRoutes.register(server, registry, social, new SkinService(dataDir));
+		CosmeticsRoutes.register(server, registry, store, cosmetics, adminToken);
+		// Discord: linking (unlocks the Velo Neon cape) and announcements through channel webhooks.
+		DiscordLinks discordLinks = new DiscordLinks(dataDir, store);
+		partnerRewards = new PartnerPlayRewards(dataDir, store);
+		DiscordRoutes.register(server, registry, store, discordLinks, envOr("VELO_DISCORD_INVITE", null), adminToken);
+		DiscordAnnouncer announcer = new DiscordAnnouncer(envOr("VELO_DISCORD_DONATIONS_WEBHOOK", null), envOr("VELO_DISCORD_REPORTS_WEBHOOK", null),
+				envOr("VELO_PUBLIC_URL", null), cosmetics, registry, store.database());
+		System.out.println("Discord: purchase announcements " + (announcer.donationsEnabled() ? "ON"
+				: envOr("VELO_DISCORD_DONATIONS_WEBHOOK", null) == null ? "OFF (set VELO_DISCORD_DONATIONS_WEBHOOK)" : "OFF - VELO_DISCORD_DONATIONS_WEBHOOK isn't a Discord webhook URL"));
+		store.setPurchaseListener(new net.veloclient.server.store.StoreService.PurchaseListener() {
+			@Override
+			public void coinsPurchased(net.veloclient.server.store.StoreDatabase.Order order, String username, int balance) {
+				announcer.donation(order, username, balance);
+			}
+
+			@Override
+			public void plusStarted(String uuid, String username) {
+				announcer.plus(uuid, username);
+			}
+		});
+		// Velo+: memberships in memory, monthly coins hourly, signed tokens + addon jars for members.
+		store.loadPlus();
+		store.loadAddonAccess();
+		store.setStaffLookup(staff::isStaff);
+		registry.setPlusLookup(store::isPlus);
+		StaffRoutes.register(server, registry, staff, social, parties, capes, store, cosmetics, discordLinks, announcer, adminToken);
+		PlusTokens plusTokens = new PlusTokens(envOr("VELO_PLUS_SIGNING_KEY", null));
+		AddonStore addonStore = new AddonStore(dataDir);
+		AddonSync addonSync = new AddonSync(addonStore, envOr("VELO_PLUS_GITHUB_REPO", "velo345/velo-client-plus"), envOr("VELO_PLUS_GITHUB_TOKEN", null));
+		PlusRoutes.register(server, registry, store, plusTokens, addonStore, addonSync, discordLinks, adminToken);
+		// Velo+ features: Cloud Sync restore points and Clips Pro share links (velo-client.com/c/<id>).
+		CloudBackupService cloud = new CloudBackupService(dataDir);
+		ClipShareService clipShares = new ClipShareService(dataDir, Long.parseLong(envOr("VELO_CLIPS_MAX_GB", "40")) * 1024 * 1024 * 1024,
+				ClipShareService.MIN_FREE_DISK, Integer.parseInt(envOr("VELO_CLIPS_RETENTION_DAYS", String.valueOf(ClipShareService.DEFAULT_RETENTION_DAYS))));
+		ModerationService moderation = new ModerationService(dataDir);
+		// The staff panel (staff.velo-client.com): launcher-code first sign-in, passkeys/password/pattern + authenticator.
+		java.util.function.Predicate<String> isOwner = uuid -> store.isOwner(uuid, social.usernameOf(uuid));
+		StaffPanel staffPanel = new StaffPanel(dataDir, envOr("VELO_STAFF_ORIGIN", "https://staff.velo-client.com"), social,
+				uuid -> isOwner.test(uuid) ? StaffService.MANAGER : staff.level(uuid), isOwner);
+		staffPanel.register(server, registry, staff, moderation, discordLinks, envOr("VELO_BOT_URL", "http://127.0.0.1:8792"), adminToken);
+		PlusFeatureRoutes.setModeration(moderation);
+		PlusFeatureRoutes.register(server, registry, store, cloud, clipShares, envOr("VELO_SITE_URL", "https://velo-client.com"));
+		// World Hosting: a raw TCP relay next to the HTTP API (its own port, not behind the web proxy).
+		WorldHostService worlds = new WorldHostService(social, Integer.parseInt(envOr("VELO_RELAY_PORT", "25600")),
+				envOr("VELO_RELAY_HOST", "api.velo-client.com"));
+		try {
+			worlds.start();
+		} catch (IOException e) {
+			System.out.println("[relay] Couldn't start the world hosting relay: " + e.getMessage());
+		}
+		worlds.setPartyLookup(parties::partyMates);
+		worlds.setArcade(new ArcadeRelay(registry, parties, social));
+		PlusFeatureRoutes.registerWorlds(server, registry, store, worlds);
+		PartnerServers partners = new PartnerServers(dataDir);
+		PlusFeatureRoutes.registerPartners(server, registry, store, partners);
+		PlusFeatureRoutes.registerUpdatePolicy(server, registry, store, new UpdatePolicy(dataDir));
+		// Partner icons + player counts for the title screen bar and Discover (clients never ping partners themselves).
+		Executors.newSingleThreadScheduledExecutor(r -> {
+			Thread t = new Thread(r, "velo-partner-ping");
+			t.setDaemon(true);
+			return t;
+		}).scheduleAtFixedRate(partners::refreshStatus, 3, 180, TimeUnit.SECONDS);
+		Executors.newSingleThreadScheduledExecutor(r -> {
+			Thread t = new Thread(r, "velo-plus-storage-sweep");
+			t.setDaemon(true);
+			return t;
+		}).scheduleAtFixedRate(() -> {
+			try {
+				long now = System.currentTimeMillis();
+				cloud.sweep(uuid -> store.wasPlusSince(uuid, now - CloudBackupService.KEEP_AFTER_PLUS_MILLIS));
+				clipShares.sweep(uuid -> store.wasPlusSince(uuid, now - ClipShareService.KEEP_AFTER_PLUS_MILLIS));
+			} catch (Exception e) {
+				System.out.println("[plus] Storage sweep failed: " + e.getMessage());
+			}
+		}, 2, 10, TimeUnit.MINUTES);
+		Executors.newSingleThreadScheduledExecutor(r -> {
+			Thread t = new Thread(r, "velo-plus-sweep");
+			t.setDaemon(true);
+			return t;
+		}).scheduleAtFixedRate(() -> {
+			store.loadPlus();
+			store.plusSweep();
+			if (addonSync.enabled()) {
+				try {
+					addonSync.sync();
+				} catch (Exception e) {
+					System.out.println("[addons] Sync failed: " + e.getMessage());
+				}
+			}
+		}, 1, 60, TimeUnit.MINUTES);
+		if (!addonSync.enabled()) {
+			System.out.println("VELO_PLUS_GITHUB_TOKEN not set - the Addons must be uploaded by hand (POST /v1/admin/addons)");
+		}
+		if (!plusTokens.enabled()) {
+			System.out.println("VELO_PLUS_SIGNING_KEY not set - no Velo+ proofs for the game");
+		}
+		reportService.setListener(announcer::report);
+		// World Notes (shared in-world notes): players' routes + staff list / read / remove.
+		NotesService notes = new NotesService(dataDir, social, parties, moderation, uuid -> store != null && store.isPlus(uuid));
+		ModerationRoutes.setNotes(notes);
+		NotesRoutes.register(server, registry, notes, moderation, social,
+				uuid -> store.isOwner(uuid, social.usernameOf(uuid)) ? StaffService.MANAGER : staff.level(uuid));
+		ModerationRoutes.register(server, registry, moderation, staff, social, store, clipShares, worlds, capes, reportService,
+				envOr("VELO_SITE_URL", "https://velo-client.com"));
+		NewsRoutes.register(server, registry, new NewsService(dataDir), reportService, store, adminToken);
+		new DoctorService(dataDir).register(server, registry, reportService, adminToken);
+		new ProfileShareService(dataDir).register(server, registry);
+		new ServerProfileService(dataDir).register(server, adminToken);
+		new BridgeService(dataDir).register(server, adminToken);
+		new BridgePanelService(dataDir, capes).register(server);
+		SchematicShareService schematics = new SchematicShareService(dataDir);
+		SchematicRoutes.register(server, registry, schematics, store);
+		server.createContext("/v1/admin/cape/remove", exchange -> handle(exchange, "POST", ex -> handleAdminCapeRemove(ex, capes, adminToken)));
+		PanelRoutes.register(server, registry, stats, store, adminToken);
+		PanelRoutes.registerStoreActions(server, store, announcer, adminToken);
+		// Creators page: the list is the owner's, channel numbers/pictures/latest videos refresh themselves every 3 hours.
+		CreatorService creators = new CreatorService(dataDir, envOr("VELO_YTDLP", "yt-dlp"));
+		PlusFeatureRoutes.registerCreators(server, registry, store, creators);
+		Executors.newSingleThreadScheduledExecutor(r -> {
+			Thread t = new Thread(r, "velo-creators");
+			t.setDaemon(true);
+			return t;
+		}).scheduleWithFixedDelay(() -> {
+			try {
+				creators.refreshAll();
+			} catch (RuntimeException e) {
+				System.err.println("[velo] creators refresh: " + e);
+			}
+		}, 20, 3 * 3600, TimeUnit.SECONDS);
+		SocialStatsService socials = new SocialStatsService(dataDir, envOr("VELO_YTDLP", "yt-dlp"), envOr("VELO_YOUTUBE_API_KEY", null));
+		socials.instagramApp(envOr("VELO_INSTAGRAM_APP_ID", null), envOr("VELO_INSTAGRAM_REDIRECT", null),
+				envOr("VELO_INSTAGRAM_APP_SECRET", null), envOr("VELO_INSTAGRAM_APP_SECRET2", null));
+		PanelRoutes.registerSocials(server, socials, adminToken);
+		Executors.newSingleThreadScheduledExecutor(r -> {
+			Thread t = new Thread(r, "velo-socials");
+			t.setDaemon(true);
+			return t;
+		}).scheduleAtFixedRate(socials::poll, 2, 180, TimeUnit.MINUTES);
+		Executors.newSingleThreadScheduledExecutor(r -> {
+			Thread t = new Thread(r, "velo-stats-sample");
+			t.setDaemon(true);
+			return t;
+		}).scheduleAtFixedRate(() -> {
+			int[] live = registry.countsByKind();
+			stats.sample(live[0], live[1], live[2]);
+		}, 1, 5, TimeUnit.MINUTES);
+
+		// Expired sessions/challenges are already ignored by every lookup
+		// (both check their own expiry), so this is just periodic
+		// housekeeping to stop the maps growing forever under real churn -
+		// not required for correctness.
+		Executors.newSingleThreadScheduledExecutor(r -> {
+			Thread t = new Thread(r, "velo-server-sweep");
+			t.setDaemon(true);
+			return t;
+		}).scheduleAtFixedRate(() -> {
+			registry.sweepExpired();
+			social.saveIfDirty();
+			social.sweepLimits();
+			schematics.sweepLimits();
+		}, 5, 5, TimeUnit.SECONDS);
+		Executors.newSingleThreadScheduledExecutor(r -> {
+			Thread t = new Thread(r, "velo-party-sweep");
+			t.setDaemon(true);
+			return t;
+		}).scheduleAtFixedRate(parties::sweep, 10, 10, TimeUnit.MINUTES);
+		Runtime.getRuntime().addShutdownHook(new Thread(social::saveIfDirty, "velo-social-save"));
+
+		server.start();
+		System.out.println("Velo Client server listening on port " + port + " (data: " + dataDir + ")");
+		if (adminToken == null) {
+			System.out.println("VELO_ADMIN_TOKEN not set - the admin cloak-removal endpoint is disabled");
+		}
+		System.out.println("Store: coin checkout " + (store.checkoutEnabled() ? "ON" : "OFF (set TEBEX_PROJECT_ID, TEBEX_PRIVATE_KEY, VELO_PUBLIC_URL)")
+				+ ", Tebex checkout " + (envOr("TEBEX_PUBLIC_TOKEN", null) != null ? "ON" : "OFF (set TEBEX_PUBLIC_TOKEN)")
+				+ ", Tebex webhooks " + (envOr("TEBEX_WEBHOOK_SECRET", envOr("TEBEX_WEBBHOOK_SECRET", null)) != null ? "ON" : "OFF (set TEBEX_WEBHOOK_SECRET)")
+				+ ", rewarded ads " + (store.adsEnabled() ? "ON" : "OFF (set AYET_PLACEMENT_ID, AYET_ADSLOT, AYET_API_KEY, VELO_PUBLIC_URL)"));
+	}
+
+	private static String envOr(String name, String fallback) {
+		String value = System.getenv(name);
+		return value == null || value.isBlank() ? fallback : value.trim();
+	}
+
+	private static int resolvePort() {
+		String env = System.getenv("VELO_SERVER_PORT");
+		if (env != null && !env.isBlank()) {
+			try {
+				return Integer.parseInt(env.trim());
+			} catch (NumberFormatException ignored) {
+				// Falls through to the default below.
+			}
+		}
+		return DEFAULT_PORT;
+	}
+
+	@FunctionalInterface
+	interface Route {
+		void handle(HttpExchange exchange) throws Exception;
+	}
+
+	/** A failure after the response headers already went out can't send an error body - just let the connection close. */
+	private static void writeErrorQuietly(HttpExchange exchange, int status, String message) {
+		try {
+			JsonHttp.writeError(exchange, status, message);
+		} catch (IOException | RuntimeException ignored) {
+			// Headers were already sent; nothing more to tell the client.
+		}
+	}
+
+	/** Shared method-check + error handling wrapper so every route below only has to write its happy path. */
+	/**
+	 * Sites allowed to call the API from a browser (the web Store): velo-client.com, plus any in VELO_WEB_ORIGINS
+	 * (comma separated, e.g. http://localhost:3000 for a local preview).
+	 */
+	private static final java.util.Set<String> WEB_ORIGINS = webOrigins();
+
+	private static java.util.Set<String> webOrigins() {
+		java.util.Set<String> origins = new java.util.HashSet<>(java.util.List.of("https://velo-client.com", "https://www.velo-client.com"));
+		String extra = System.getenv("VELO_WEB_ORIGINS");
+		if (extra != null) {
+			for (String origin : extra.split(",")) {
+				if (!origin.isBlank()) {
+					origins.add(origin.trim());
+				}
+			}
+		}
+		return java.util.Set.copyOf(origins);
+	}
+
+	/** CORS for the website; true when this was a preflight that's now answered. */
+	private static boolean cors(HttpExchange exchange) throws IOException {
+		String origin = exchange.getRequestHeaders().getFirst("Origin");
+		if (origin != null && WEB_ORIGINS.contains(origin)) {
+			var headers = exchange.getResponseHeaders();
+			headers.set("Access-Control-Allow-Origin", origin);
+			headers.set("Vary", "Origin");
+			headers.set("Access-Control-Allow-Headers", "Authorization, Content-Type");
+			headers.set("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+			headers.set("Access-Control-Max-Age", "600");
+		}
+		if ("OPTIONS".equals(exchange.getRequestMethod())) {
+			exchange.sendResponseHeaders(204, -1);
+			return true;
+		}
+		return false;
+	}
+
+	static void handle(HttpExchange exchange, String requiredMethod, Route route) throws IOException {
+		try {
+			if (cors(exchange)) {
+				return;
+			}
+			if (!requiredMethod.equals(exchange.getRequestMethod())) {
+				JsonHttp.writeError(exchange, 405, "Method not allowed");
+				return;
+			}
+			route.handle(exchange);
+		} catch (CapeStore.RejectedUpload e) {
+			writeErrorQuietly(exchange, e.status, e.getMessage());
+		} catch (ApiError e) {
+			writeErrorQuietly(exchange, e.status, e.getMessage());
+		} catch (SocialService.SocialException e) {
+			writeErrorQuietly(exchange, e.status, e.getMessage());
+		} catch (net.veloclient.server.store.StoreService.StoreException e) {
+			writeErrorQuietly(exchange, e.status, e.getMessage());
+		} catch (NewsService.NewsException e) {
+			writeErrorQuietly(exchange, e.status, e.getMessage());
+		} catch (SchematicShareService.SchematicException e) {
+			writeErrorQuietly(exchange, e.status, e.getMessage());
+		} catch (IOException e) {
+			writeErrorQuietly(exchange, 400, e.getMessage() != null ? e.getMessage() : "Bad request");
+		} catch (Exception e) {
+			e.printStackTrace();
+			writeErrorQuietly(exchange, 500, "Internal server error");
+		} finally {
+			exchange.close();
+		}
+	}
+
+	private record HealthResponse(String status, int onlineCount) {
+	}
+
+	private static void handleHealth(HttpExchange exchange, SessionRegistry registry) throws IOException {
+		JsonHttp.writeJson(exchange, 200, new HealthResponse("ok", registry.onlineCount()));
+	}
+
+	private record ChallengeRequest(String uuid, String username, String kind) {
+	}
+
+	private record ChallengeResponse(String serverId) {
+	}
+
+	private static void handleChallenge(HttpExchange exchange, SessionRegistry registry) throws IOException {
+		ChallengeRequest request = JsonHttp.readBody(exchange, ChallengeRequest.class);
+		String uuid = normalizeUuid(request.uuid());
+		String username = validUsername(request.username());
+		if (uuid == null || username == null) {
+			JsonHttp.writeError(exchange, 400, "uuid and username are required");
+			return;
+		}
+		String serverId = registry.createChallenge(uuid, username, request.kind());
+		JsonHttp.writeJson(exchange, 200, new ChallengeResponse(serverId));
+	}
+
+	private record VerifyRequest(String uuid, String serverId, String kind) {
+	}
+
+	private record VerifyResponse(String sessionToken, long heartbeatIntervalSeconds, long sessionTtlSeconds) {
+	}
+
+	private static void handleVerify(HttpExchange exchange, SessionRegistry registry) throws IOException {
+		VerifyRequest request = JsonHttp.readBody(exchange, VerifyRequest.class);
+		String uuid = normalizeUuid(request.uuid());
+		if (uuid == null || request.serverId() == null || request.serverId().isBlank()) {
+			JsonHttp.writeError(exchange, 400, "uuid and serverId are required");
+			return;
+		}
+		SessionRegistry.Challenge challenge = registry.takeChallenge(uuid, request.kind(), request.serverId());
+		if (challenge == null) {
+			JsonHttp.writeError(exchange, 400, "Unknown or expired challenge - request a new one");
+			return;
+		}
+		String verifiedUuid = MojangSessionVerifier.verify(challenge.username(), challenge.serverId());
+		if (verifiedUuid == null || !verifiedUuid.equals(uuid)) {
+			JsonHttp.writeError(exchange, 401, "Mojang could not verify this session - did the client actually join with this serverId?");
+			return;
+		}
+		StaffService.Ban networkBan = staff == null ? null : staff.banFor(uuid, "network");
+		if (networkBan != null) {
+			JsonHttp.writeError(exchange, 403, "This account is banned from the Velo Network" + (networkBan.reason == null || networkBan.reason.isBlank() ? "" : ": " + networkBan.reason)
+					+ (networkBan.until > 0 ? " (until " + java.time.Instant.ofEpochMilli(networkBan.until).toString().substring(0, 10) + ")" : ""));
+			return;
+		}
+		String token = registry.createSession(uuid, challenge.username(), challenge.kind());
+		social.onAuthenticated(uuid, challenge.username());
+		stats.signedIn(uuid, challenge.username(), challenge.kind());
+		if (store != null) {
+			store.launchBonus(uuid, challenge.username(), stats.firstSeen(uuid));
+		}
+		JsonHttp.writeJson(exchange, 200, new VerifyResponse(token,
+				SessionRegistry.HEARTBEAT_INTERVAL_SECONDS, SessionRegistry.SESSION_TTL_MILLIS / 1000));
+	}
+
+	/** {@code wear}: equipped bodywear, "id,id,..." (item ids without "wear_"). */
+	private record HeartbeatRequest(String sessionToken, String capeId, String wingsId, String auraId, Boolean idle, Boolean hidePlus, String nameStyle,
+			String emote, String wear, String pet, Boolean og) {
+	}
+
+	/** {@code ogEligible}: this account may switch to the OG badge (see {@link OgBadge}). */
+	private record HeartbeatResponse(boolean ok, int onlineCount, String capeId, boolean ogEligible) {
+	}
+
+	private record CosmeticsOfRequest(java.util.List<String> uuids) {
+	}
+
+	private record LookView(String uuid, String capeId, String wingsId, String auraId, String wear, String pet) {
+	}
+
+	private record CosmeticsOfResponse(java.util.List<LookView> users) {
+	}
+
+	/**
+	 * POST {"uuids": [...]} (up to 200): the last in-game look of each Velo player among them who isn't online with Velo right
+	 * now - so their cloak, wings and the rest still show while they play on another client. The cloak is checked again
+	 * (a removed custom cloak shows the redacted one, a Store cloak only while they own it).
+	 */
+	private static void handleCosmeticsOf(HttpExchange exchange, SessionRegistry registry, CapeStore capes) throws IOException {
+		CosmeticsOfRequest request = JsonHttp.readBody(exchange, CosmeticsOfRequest.class);
+		java.util.Set<String> online = new java.util.HashSet<>();
+		for (SessionRegistry.OnlineUser user : registry.onlineUsers()) {
+			online.add(user.uuid());
+		}
+		java.util.List<LookView> out = new java.util.ArrayList<>();
+		java.util.List<String> uuids = request == null || request.uuids() == null ? java.util.List.of() : request.uuids();
+		for (String raw : uuids.subList(0, Math.min(200, uuids.size()))) {
+			String uuid = normalizeUuid(raw);
+			if (uuid == null || online.contains(uuid)) {
+				continue;
+			}
+			LastCosmetics.Look look = lastLooks == null ? null : lastLooks.get(uuid);
+			if (look == null || look.empty()) {
+				continue;
+			}
+			String cape = look.capeId();
+			if (cape != null && cape.startsWith(CapeStore.CUSTOM_PREFIX)) {
+				String hash = capes.hashFor(uuid, store.isPlus(uuid));
+				cape = capes.isRedacted(uuid) ? CapeStore.REDACTED_CAPE : hash != null && cape.equals(CapeStore.CUSTOM_PREFIX + hash) ? cape : null;
+			} else if (cape != null && !CapeStore.REDACTED_CAPE.equals(cape) && !store.mayDisplayCape(uuid, cape)) {
+				cape = null;
+			}
+			out.add(new LookView(uuid, cape, look.wingsId(), look.auraId(), look.wear(), look.pet()));
+		}
+		JsonHttp.writeJson(exchange, 200, new CosmeticsOfResponse(out));
+	}
+
+	private static void handleHeartbeat(HttpExchange exchange, SessionRegistry registry, CapeStore capes) throws IOException {
+		HeartbeatRequest request = JsonHttp.readBody(exchange, HeartbeatRequest.class);
+		if (request.sessionToken() == null || request.sessionToken().isBlank()) {
+			JsonHttp.writeError(exchange, 400, "sessionToken is required");
+			return;
+		}
+		SessionRegistry.Session session = registry.session(request.sessionToken());
+		// A player banned from custom capes shows none (their upload is ignored).
+		String ownCustomHash = session == null || staff != null && staff.banFor(session.uuid(), "capes") != null ? null
+				: capes.hashFor(session.uuid(), store.isPlus(session.uuid()));
+		// Store capes are only shown for players who actually own them (server-side ownership).
+		String capeId = session != null && !store.mayDisplayCape(session.uuid(), request.capeId()) ? null : request.capeId();
+		// Staff removed this player's custom cloak: everyone sees the black "REDACTED" cloak instead, while the player
+		// still has the removed one on (it's cached on their side, so their client keeps sending it or nothing) - picking
+		// a Store cloak or uploading a new accepted one ends it.
+		if (session != null && capes.isRedacted(session.uuid())) {
+			String wanted = request.capeId();
+			boolean removedOne = wanted == null || wanted.isBlank()
+					|| wanted.startsWith(CapeStore.CUSTOM_PREFIX) && capes.isBanned(wanted.substring(CapeStore.CUSTOM_PREFIX.length()).trim());
+			if (removedOne) {
+				capeId = CapeStore.REDACTED_CAPE;
+			} else if (wanted.startsWith(CapeStore.CUSTOM_PREFIX) || capeId != null) {
+				capes.setRedacted(session.uuid(), false);
+			}
+		}
+		// Wings are store items too ("wings_<id>"): only shown for players who bought them.
+		String wingsId = request.wingsId();
+		if (session != null && wingsId != null) {
+			String wingsItem = "wings_" + wingsId.split(";", 2)[0];
+			if (!store.mayDisplayCape(session.uuid(), wingsItem) || !store.knownItem(wingsItem)) {
+				wingsId = null;
+			}
+		}
+		// Auras too ("aura_<id>"), same rules.
+		String auraId = request.auraId();
+		if (session != null && auraId != null) {
+			String auraItem = "aura_" + auraId.split(";", 2)[0];
+			if (!store.mayDisplayCape(session.uuid(), auraItem) || !store.knownItem(auraItem)) {
+				auraId = null;
+			}
+		}
+		// Name styles are a Velo+ perk.
+		String nameStyle = session != null && store.isPlus(session.uuid()) ? request.nameStyle() : null;
+		SessionRegistry.Session refreshed = registry.heartbeat(request.sessionToken(), capeId, ownCustomHash, wingsId, auraId, nameStyle);
+		if (refreshed != null) {
+			stats.active(refreshed.uuid(), refreshed.kind());
+		}
+		if (refreshed != null && "game".equals(refreshed.kind())) {
+			store.onGameHeartbeat(refreshed.uuid());
+			if (partnerRewards != null) {
+				SocialService.Activity activity = social.gameActivity(refreshed.uuid());
+				partnerRewards.onGameHeartbeat(refreshed.uuid(), refreshed.username(), activity == null ? null : activity.kind(),
+						activity == null ? null : activity.detail());
+			}
+			if (request.hidePlus() != null) {
+				registry.setPlusHidden(refreshed.uuid(), request.hidePlus());
+			}
+			registry.setOg(refreshed.uuid(), Boolean.TRUE.equals(request.og()) && og != null && og.eligible(refreshed.uuid()));
+			// Emotes are store items too ("emote_<id>"): only relayed for players who bought them.
+			String emote = request.emote();
+			if (emote != null) {
+				String emoteItem = "emote_" + emote.split(";", 2)[0];
+				if (!store.knownItem(emoteItem) || !store.mayDisplayCape(refreshed.uuid(), emoteItem)) {
+					emote = null;
+				}
+			}
+			registry.setEmote(refreshed.uuid(), emote);
+			// Bodywear: store items too ("wear_<id>", optionally ":<rrggbb>" or an old ":<hue code>", then height and depth ":<quarter px>"), each shown only if it's owned.
+			String wear = null;
+			if (request.wear() != null && request.wear().length() <= 400) {
+				java.util.List<String> shown = new java.util.ArrayList<>();
+				for (String entry : request.wear().split(",")) {
+					String id = entry.split(":", 2)[0];
+					String item = "wear_" + id;
+					if (entry.matches("[a-z0-9_-]{1,40}(:([0-9]{1,3}|[0-9a-f]{6})?(:-?[0-9](:-?[0-9])?)?)?") && shown.size() < 8 && store.knownItem(item)
+							&& store.mayDisplayCape(refreshed.uuid(), item)) {
+						shown.add(entry);
+					}
+				}
+				wear = shown.isEmpty() ? null : String.join(",", shown);
+			}
+			registry.setWear(refreshed.uuid(), wear);
+			// Pets: store items too ("pet_<id>"), shown to others only if owned.
+			String pet = request.pet();
+			if (pet != null && (!pet.matches("[a-z0-9_]{1,40}") || !store.knownItem("pet_" + pet) || !store.mayDisplayCape(refreshed.uuid(), "pet_" + pet))) {
+				pet = null;
+			}
+			registry.setPet(refreshed.uuid(), pet);
+			if (lastLooks != null) {
+				lastLooks.record(refreshed.uuid(), refreshed.capeId(), refreshed.wingsId(), refreshed.auraId(), wear, pet);
+			}
+		}
+		if (refreshed != null && "launcher".equals(refreshed.kind())
+				&& registry.setIdle(request.sessionToken(), Boolean.TRUE.equals(request.idle()))) {
+			// Idle <-> active changes what friends see.
+			social.refreshPresence(refreshed.uuid());
+		}
+		if (refreshed == null) {
+			JsonHttp.writeError(exchange, 401, "Unknown or expired session - re-authenticate");
+			return;
+		}
+		// Echoes the cape id actually accepted, so a client whose custom cape was removed (or a
+		// server whose data was reset) notices and can re-upload instead of silently showing nothing.
+		JsonHttp.writeJson(exchange, 200, new HeartbeatResponse(true, registry.onlineCount(), refreshed.capeId(),
+				og != null && og.eligible(refreshed.uuid())));
+	}
+
+	private record EndRequest(String sessionToken) {
+	}
+
+	/** Launcher token: the game it started has ended, so any game session of the account is stale. */
+	private static void handleEndGame(HttpExchange exchange, SessionRegistry registry) throws IOException {
+		EndRequest request = JsonHttp.readBody(exchange, EndRequest.class);
+		if (request.sessionToken() != null) {
+			registry.endGameSessions(request.sessionToken());
+		}
+		JsonHttp.writeJson(exchange, 200, new HeartbeatResponse(true, registry.onlineCount(), null, false));
+	}
+
+	private static void handleEnd(HttpExchange exchange, SessionRegistry registry) throws IOException {
+		EndRequest request = JsonHttp.readBody(exchange, EndRequest.class);
+		if (request.sessionToken() != null) {
+			registry.endSession(request.sessionToken());
+		}
+		JsonHttp.writeJson(exchange, 200, new HeartbeatResponse(true, registry.onlineCount(), null, false));
+	}
+
+	private record OnlineResponse(List<SessionRegistry.OnlineUser> users, long serverTimeMillis) {
+	}
+
+	private record LiveStats(int online, long today, long at) {
+	}
+
+	private static volatile LiveStats liveStats;
+
+	private static void handleLiveStats(HttpExchange exchange, SessionRegistry registry) throws IOException {
+		LiveStats cached = liveStats;
+		long now = System.currentTimeMillis();
+		if (cached == null || now - cached.at() > 30_000) {
+			long today = cached == null ? 0 : cached.today();
+			try {
+				today = stats == null ? 0 : stats.activeToday();
+			} catch (java.sql.SQLException e) {
+				// keep the last number
+			}
+			cached = new LiveStats(registry.onlineCount(), today, now);
+			liveStats = cached;
+		}
+		exchange.getResponseHeaders().set("Cache-Control", "public, max-age=30");
+		JsonHttp.writeJson(exchange, 200, cached);
+	}
+
+	private static void handleOnline(HttpExchange exchange, SessionRegistry registry) throws IOException {
+		JsonHttp.writeJson(exchange, 200, new OnlineResponse(registry.onlineUsers(), System.currentTimeMillis()));
+	}
+
+	private record CapeUploadResponse(String capeId) {
+	}
+
+	/** Raw PNG/GIF body, authenticated with the session token as {@code Authorization: Bearer}. */
+	private static void handleCapeUpload(HttpExchange exchange, SessionRegistry registry, CapeStore capes) throws Exception {
+		SessionRegistry.Session session = registry.session(JsonHttp.bearerToken(exchange));
+		if (session == null) {
+			JsonHttp.writeError(exchange, 401, "Unknown or expired session - re-authenticate");
+			return;
+		}
+		if (staff != null && staff.banFor(session.uuid(), "capes") != null) {
+			JsonHttp.writeError(exchange, 403, "You're banned from custom cloaks: " + staff.banFor(session.uuid(), "capes").reason);
+			return;
+		}
+		byte[] bytes = JsonHttp.readRawBody(exchange, CapeStore.MAX_UPLOAD_BYTES);
+		String hash = capes.store(session.uuid(), bytes, store.isPlus(session.uuid()));
+		JsonHttp.writeJson(exchange, 200, new CapeUploadResponse(CapeStore.CUSTOM_PREFIX + hash));
+	}
+
+	private record OkResponse(boolean ok) {
+	}
+
+	private static void handleCapeRemove(HttpExchange exchange, SessionRegistry registry, CapeStore capes) throws IOException {
+		SessionRegistry.Session session = registry.session(JsonHttp.bearerToken(exchange));
+		if (session == null) {
+			JsonHttp.writeError(exchange, 401, "Unknown or expired session - re-authenticate");
+			return;
+		}
+		JsonHttp.writeJson(exchange, 200, new OkResponse(capes.remove(session.uuid())));
+	}
+
+	private static void handleCapeDownload(HttpExchange exchange, CapeStore capes) throws IOException {
+		String path = exchange.getRequestURI().getPath();
+		String hash = path.substring(path.lastIndexOf('/') + 1);
+		CapeStore.FileRef file = capes.locate(hash, store::isPlus);
+		if (file == null) {
+			JsonHttp.writeError(exchange, 404, "No such cloak");
+			return;
+		}
+		// Content-addressed, so a given URL's bytes can never change - clients and any proxy/CDN
+		// in front of this can cache it forever. Streamed from disk: HD and animated cloaks are several MB each.
+		JsonHttp.writeFile(exchange, file.path(), java.nio.file.Files.size(file.path()), file.contentType(), hash, "public, max-age=31536000, immutable");
+	}
+
+	private record AdminRemoveRequest(String uuid) {
+	}
+
+	/** Moderation: removes (and bans the image of) a player's custom cape. Needs {@code Authorization: Bearer $VELO_ADMIN_TOKEN}. */
+	private static void handleAdminCapeRemove(HttpExchange exchange, CapeStore capes, String adminToken) throws IOException {
+		String given = JsonHttp.bearerToken(exchange);
+		if (adminToken == null || given == null
+				|| !java.security.MessageDigest.isEqual(adminToken.getBytes(), given.getBytes())) {
+			JsonHttp.writeError(exchange, 403, "Forbidden");
+			return;
+		}
+		AdminRemoveRequest request = JsonHttp.readBody(exchange, AdminRemoveRequest.class);
+		String uuid = normalizeUuid(request.uuid());
+		if (uuid == null) {
+			JsonHttp.writeError(exchange, 400, "uuid is required");
+			return;
+		}
+		JsonHttp.writeJson(exchange, 200, new OkResponse(capes.removeAndBan(uuid)));
+	}
+
+	/** Accepts dashed or dashless UUIDs from the client; everything downstream keys on this same lowercase-dashless form. */
+	static String normalizeUuid(String uuid) {
+		if (uuid == null) {
+			return null;
+		}
+		String normalized = uuid.replace("-", "").toLowerCase();
+		return normalized.length() == 32 ? normalized : null;
+	}
+
+	private static String validUsername(String username) {
+		if (username == null || !username.matches("[a-zA-Z0-9_]{1,16}")) {
+			return null;
+		}
+		return username;
+	}
+
+	private VeloServerApp() {
+	}
+}

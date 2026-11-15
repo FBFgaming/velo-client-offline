@@ -1,0 +1,731 @@
+package net.veloclient.server.store;
+
+import com.google.gson.Gson;
+import com.google.gson.GsonBuilder;
+
+import java.io.IOException;
+import java.io.InputStream;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.StandardCopyOption;
+import java.security.MessageDigest;
+import java.util.ArrayList;
+import java.util.HexFormat;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Locale;
+import java.util.Map;
+import java.util.Set;
+import java.util.regex.Pattern;
+
+/**
+ * Every cosmetic the clients can show - wings, capes, auras and emotes - with its art, so adding one never needs a
+ * client update: the clients download the catalog and any art they don't ship with.
+ *
+ * <p>Stored in {@code cosmetics/catalog.json} in the data directory, the art content-addressed under
+ * {@code cosmetics/files/<sha256>} (clients cache it forever and check the hash). Each item has a
+ * {@link #STATUS_RELEASED released} / {@link #STATUS_TESTING testing} / {@link #STATUS_HIDDEN hidden}
+ * status and an optional time window: only released items inside their window are sold. Testing
+ * and hidden items can still be given by the owner and are shown on whoever owns them - so a pair
+ * can be tried out with everyone seeing it before anyone can buy it, and a limited collection can
+ * be taken out of the store again without taking it away from the people who bought it.
+ *
+ * <p>Items the server ships with (bundled under {@code /cosmetics-seed/} in the jar) are added on
+ * start when missing; anything already in the catalog is never overwritten, so the owner's edits
+ * (status, price, window...) stay.
+ */
+public final class CosmeticsService {
+
+	public static final String STATUS_RELEASED = "released";
+	public static final String STATUS_TESTING = "testing";
+	public static final String STATUS_HIDDEN = "hidden";
+	private static final Set<String> STATUSES = Set.of(STATUS_RELEASED, STATUS_TESTING, STATUS_HIDDEN);
+	private static final Set<String> TYPES = Set.of("wings", "cape", "aura", "emote", "killfx", "wear", "pet");
+	private static final Pattern ITEM_ID = Pattern.compile("(wings|cape|aura|emote|killfx|wear|pet)_[a-z0-9_-]{1,40}");
+	/** Where bodywear sits: one item per slot, every slot combinable. */
+	public static final Set<String> WEAR_SLOTS = Set.of("head", "ears", "face", "mask", "neck", "wrist", "feet", "back");
+	private static final Pattern COLLECTION_ID = Pattern.compile("[a-z0-9_-]{1,40}");
+	private static final Pattern SHA256 = Pattern.compile("[0-9a-f]{64}");
+	public static final int MAX_FILE_BYTES = 12 * 1024 * 1024;
+
+	private static final Gson GSON = new GsonBuilder().setPrettyPrinting().create();
+
+	/**
+	 * One cosmetic. {@code files}: role -> sha256 (wings: mesh, texture, preview; capes: gif). Fields an
+	 * owner edit leaves out stay null, so only what's given changes.
+	 */
+	public static final class Item {
+		public String id;
+		public String type;
+		public String name;
+		public String description;
+		public int price;
+		public String status;
+		public String collection;
+		/** Epoch millis; null = no limit. Only matters for released items. */
+		public Long availableFrom;
+		public Long availableUntil;
+		public String accent;
+		public String style;
+		public Float scale;
+		public Float offsetY;
+		/** Drawn full-bright (neon). */
+		public Boolean glow;
+		/** How it's earned instead of bought ("discord" = linking your Discord account); such an item is never sold, whatever its status. */
+		public String unlock;
+		/** Bodywear: its slot ({@link #WEAR_SLOTS}). */
+		public String slot;
+		/**
+		 * Bodywear: the model, drawn the same way by the game, the launcher and the website - {"parts": [{"bone":
+		 * "head|body|rightArm|leftArm|rightLeg|leftLeg", "boxes": [[x, y, z, w, h, d, "#rrggbb"], ...]}]}, in skin pixels
+		 * from the bone's pivot (Minecraft model space: y down, the face towards -z).
+		 */
+		public com.google.gson.JsonElement model;
+		public Map<String, String> files;
+		public long addedAt;
+		/** Seed revision: when the bundled seed's revision is higher, the item's art (and text) is refreshed from it - owner-set price/status/window stay. */
+		public int rev;
+
+		Item copy() {
+			Item c = GSON.fromJson(GSON.toJson(this), Item.class);
+			return c;
+		}
+	}
+
+	/** A themed drop, e.g. "Afterlife". */
+	public static final class Collection {
+		public String id;
+		public String name;
+		public String tag = "COLLECTION";
+		public String description = "";
+	}
+
+	/** An owner-made offer: several items for one price, optionally only until a day. */
+	public static final class Bundle {
+		public String id;
+		public String name;
+		public String description = "";
+		public List<String> items = new ArrayList<>();
+		public int price;
+		public boolean active;
+		/** Epoch millis; null = no end. */
+		public Long availableUntil;
+	}
+
+	private static final class Data {
+		String featured;
+		List<Collection> collections = new ArrayList<>();
+		List<Item> items = new ArrayList<>();
+		List<Bundle> bundles = new ArrayList<>();
+	}
+
+	/** The seed bundled in the jar: the same shape plus where each file is ({@code files} are paths inside the seed). */
+	private static final class Seed {
+		String featured;
+		List<Collection> collections = new ArrayList<>();
+		List<Item> items = new ArrayList<>();
+	}
+
+	private final Path dir;
+	private final Path filesDir;
+	private final Path catalogFile;
+	private Data data;
+
+	public CosmeticsService(Path dataDir) throws IOException {
+		this.dir = dataDir.resolve("cosmetics");
+		this.filesDir = dir.resolve("files");
+		this.catalogFile = dir.resolve("catalog.json");
+		Files.createDirectories(filesDir);
+		data = Files.exists(catalogFile) ? GSON.fromJson(Files.readString(catalogFile, StandardCharsets.UTF_8), Data.class) : null;
+		if (data == null) {
+			data = new Data();
+		}
+		if (data.collections == null) {
+			data.collections = new ArrayList<>();
+		}
+		if (data.items == null) {
+			data.items = new ArrayList<>();
+		}
+	}
+
+	// ---- Seeding ----
+
+	/**
+	 * Adds the bundled items/collections that aren't in the catalog yet. {@code prices} (from an older
+	 * store.json) win over the seed's prices, so owner-set prices survive the move to this catalog.
+	 */
+	public synchronized void seedFromClasspath(String root, Map<String, Integer> prices) throws IOException {
+		Seed seed;
+		try (InputStream in = CosmeticsService.class.getResourceAsStream(root + "seed.json")) {
+			if (in == null) {
+				return;
+			}
+			seed = GSON.fromJson(new String(in.readAllBytes(), StandardCharsets.UTF_8), Seed.class);
+		}
+		boolean changed = false;
+		if (data.featured == null && seed.featured != null) {
+			data.featured = seed.featured;
+			changed = true;
+		}
+		for (Collection c : seed.collections) {
+			if (collection(c.id) == null) {
+				data.collections.add(c);
+				changed = true;
+			}
+		}
+		// The "Neon" collection became the "Future" collection: rename it unless the owner already edited it.
+		Collection neon = collection("neon");
+		if (neon != null && "Neon".equals(neon.name) && "NEON COLLECTION".equals(neon.tag)) {
+			for (Collection c : seed.collections) {
+				if (c.id.equals("neon")) {
+					neon.name = c.name;
+					neon.tag = c.tag;
+					neon.description = c.description;
+					changed = true;
+				}
+			}
+		}
+		for (Item s : seed.items) {
+			Item existing = find(s.id);
+			if (existing != null) {
+				if (s.rev > existing.rev) {
+					// Redrawn art / reworded text shipped with a newer server: refresh it, keep everything the owner set.
+					Map<String, String> hashes = seedFiles(root, s);
+					if (hashes != null) {
+						existing.files = hashes;
+						if (s.description != null) {
+							existing.description = s.description;
+						}
+						if (s.model != null) {
+							existing.model = s.model;
+							existing.slot = s.slot;
+						}
+						existing.rev = s.rev;
+						changed = true;
+					}
+				}
+				continue;
+			}
+			Item item = s.copy();
+			Map<String, String> hashes = seedFiles(root, s);
+			if (hashes == null) {
+				continue;
+			}
+			item.files = hashes;
+			if (prices != null && prices.containsKey(item.id)) {
+				item.price = prices.get(item.id);
+			}
+			item.addedAt = System.currentTimeMillis();
+			data.items.add(item);
+			changed = true;
+		}
+		if (changed) {
+			save();
+		}
+	}
+
+	/** Stores a seed item's bundled files and returns role -> sha256, or null when one is missing from the jar. */
+	private Map<String, String> seedFiles(String root, Item s) throws IOException {
+		Map<String, String> hashes = new LinkedHashMap<>();
+		for (Map.Entry<String, String> file : s.files.entrySet()) {
+			try (InputStream in = CosmeticsService.class.getResourceAsStream(root + file.getValue())) {
+				if (in == null) {
+					System.out.println("[cosmetics] Seed file missing: " + file.getValue());
+					return null;
+				}
+				hashes.put(file.getKey(), storeFile(in.readAllBytes()));
+			} catch (StoreService.StoreException e) {
+				throw new IOException("Bad seed file " + file.getValue() + ": " + e.getMessage());
+			}
+		}
+		return hashes;
+	}
+
+	// ---- Reading ----
+
+	private Item find(String id) {
+		for (Item item : data.items) {
+			if (item.id.equals(id)) {
+				return item;
+			}
+		}
+		return null;
+	}
+
+	private Collection collection(String id) {
+		for (Collection c : data.collections) {
+			if (c.id.equals(id)) {
+				return c;
+			}
+		}
+		return null;
+	}
+
+	/** A copy of the item, or null. */
+	public synchronized Item item(String id) {
+		Item item = id == null ? null : find(id);
+		return item == null ? null : item.copy();
+	}
+
+	public synchronized boolean exists(String id) {
+		return id != null && find(id) != null;
+	}
+
+	/** Released and inside its time window: shown in the store and can be bought. */
+	public static boolean inStore(Item item, long now) {
+		return item.unlock == null && STATUS_RELEASED.equals(item.status) && (item.availableFrom == null || item.availableFrom <= now)
+				&& (item.availableUntil == null || item.availableUntil > now);
+	}
+
+	public synchronized boolean buyable(String id) {
+		Item item = find(id);
+		return item != null && inStore(item, System.currentTimeMillis());
+	}
+
+	/** What a client may see of an item: everything except the owner-only status details. */
+	public record ItemView(String id, String type, String name, String description, int price, String collection, String accent,
+			String style, Float scale, Float offsetY, Boolean glow, Map<String, String> files, boolean inStore, Long availableUntil, String status,
+			String unlock, String slot, com.google.gson.JsonElement model) {
+	}
+
+	public record CollectionView(String id, String name, String tag, String description) {
+	}
+
+	public record CatalogView(String featured, List<CollectionView> collections, List<ItemView> items) {
+	}
+
+	private static ItemView view(Item i, long now, boolean withStatus) {
+		boolean inStore = inStore(i, now);
+		return new ItemView(i.id, i.type, i.name, i.description, i.price, i.collection, i.accent, i.style, i.scale, i.offsetY, i.glow,
+				Map.copyOf(i.files), inStore, inStore ? i.availableUntil : null, withStatus ? i.status : null, i.unlock, i.slot, i.model);
+	}
+
+	/**
+	 * The catalog for one viewer: what's in the store, plus whatever they own (in any status); an owner
+	 * sees everything with its status. Collections are only listed when something in them is visible.
+	 */
+	public synchronized CatalogView catalog(Set<String> owned, boolean owner) {
+		long now = System.currentTimeMillis();
+		List<ItemView> items = new ArrayList<>();
+		Set<String> usedCollections = new java.util.HashSet<>();
+		for (Item i : data.items) {
+			if (owner || inStore(i, now) || owned.contains(i.id)) {
+				items.add(view(i, now, owner));
+				if (i.collection != null) {
+					usedCollections.add(i.collection);
+				}
+			}
+		}
+		List<CollectionView> collections = new ArrayList<>();
+		for (Collection c : data.collections) {
+			if (owner || usedCollections.contains(c.id)) {
+				collections.add(new CollectionView(c.id, c.name, c.tag, c.description));
+			}
+		}
+		return new CatalogView(data.featured, collections, items);
+	}
+
+	/** What's needed to draw an item on someone else (any status - testers are seen by everyone). */
+	public synchronized ItemView renderInfo(String id) {
+		Item item = find(id);
+		if (item == null) {
+			return null;
+		}
+		ItemView v = view(item, System.currentTimeMillis(), false);
+		return new ItemView(v.id(), v.type(), v.name(), v.description(), 0, v.collection(), v.accent(), v.style(), v.scale(), v.offsetY(), v.glow(),
+				v.files(), v.inStore(), null, null, v.unlock(), v.slot(), v.model());
+	}
+
+	/** Released items in their window, for the old {@code /v1/store/catalog} price list. */
+	public synchronized List<StoreConfig.Item> storeItems() {
+		long now = System.currentTimeMillis();
+		List<StoreConfig.Item> out = new ArrayList<>();
+		for (Item i : data.items) {
+			if (inStore(i, now)) {
+				out.add(new StoreConfig.Item(i.id, i.name, i.price));
+			}
+		}
+		return out;
+	}
+
+	/** A collection with the items of it that are in the store right now. */
+	public record StoreCollection(String id, String name, String description, List<StoreConfig.Item> items) {
+	}
+
+	public synchronized List<StoreCollection> storeCollections() {
+		long now = System.currentTimeMillis();
+		List<StoreCollection> out = new ArrayList<>();
+		for (Collection c : data.collections) {
+			List<StoreConfig.Item> items = new ArrayList<>();
+			for (Item i : data.items) {
+				if (c.id.equals(i.collection) && inStore(i, now)) {
+					items.add(new StoreConfig.Item(i.id, i.name, i.price));
+				}
+			}
+			out.add(new StoreCollection(c.id, c.name, c.description, items));
+		}
+		return out;
+	}
+
+	/** An owner bundle as sold now: only the items of it that are in the store. */
+	public record StoreBundle(String id, String name, String description, List<StoreConfig.Item> items, int price) {
+	}
+
+	/** Active owner bundles in their window with at least two items in the store; null when the owner made none. */
+	public synchronized List<StoreBundle> storeBundles() {
+		if (data.bundles == null || data.bundles.isEmpty()) {
+			return null;
+		}
+		long now = System.currentTimeMillis();
+		List<StoreBundle> out = new ArrayList<>();
+		for (Bundle b : data.bundles) {
+			if (!b.active || b.availableUntil != null && now >= b.availableUntil) {
+				continue;
+			}
+			List<StoreConfig.Item> items = new ArrayList<>();
+			for (String id : b.items) {
+				Item i = find(id);
+				if (i != null && inStore(i, now)) {
+					items.add(new StoreConfig.Item(i.id, i.name, i.price));
+				}
+			}
+			if (items.size() >= 2) {
+				out.add(new StoreBundle(b.id, b.name, b.description, items, b.price));
+			}
+		}
+		return out;
+	}
+
+	public synchronized Bundle upsertBundle(Bundle change) throws IOException, StoreService.StoreException {
+		if (change == null || change.id == null || !COLLECTION_ID.matcher(change.id).matches()) {
+			throw new StoreService.StoreException(400, "Bundle ids are lowercase letters, digits, _ or -");
+		}
+		if (change.items == null || change.items.size() < 2) {
+			throw new StoreService.StoreException(400, "A bundle needs at least two items");
+		}
+		for (String id : change.items) {
+			if (find(id) == null) {
+				throw new StoreService.StoreException(404, "Unknown item " + id);
+			}
+		}
+		if (change.price <= 0 || change.price > 1_000_000) {
+			throw new StoreService.StoreException(400, "Price: 1 to 1,000,000 coins");
+		}
+		if (data.bundles == null) {
+			data.bundles = new ArrayList<>();
+		}
+		Bundle b = data.bundles.stream().filter(x -> x.id.equals(change.id)).findFirst().orElse(null);
+		if (b == null) {
+			b = new Bundle();
+			b.id = change.id;
+			data.bundles.add(0, b);
+		}
+		b.name = change.name == null || change.name.isBlank() ? change.id : change.name.strip();
+		b.description = change.description == null ? "" : change.description.strip();
+		b.items = new ArrayList<>(new java.util.LinkedHashSet<>(change.items));
+		b.price = change.price;
+		b.active = change.active;
+		b.availableUntil = change.availableUntil;
+		save();
+		return b;
+	}
+
+	public synchronized void deleteBundle(String id) throws IOException, StoreService.StoreException {
+		if (data.bundles == null || !data.bundles.removeIf(b -> b.id.equals(id))) {
+			throw new StoreService.StoreException(404, "No such bundle");
+		}
+		save();
+	}
+
+	/**
+	 * Takes a hidden item out of the catalog for good (only hidden ones - nothing in a store or being tested; and not
+	 * while a bundle still lists it). It also has to leave the bundled seed, or the next start puts it back.
+	 */
+	public synchronized void deleteItem(String id) throws IOException, StoreService.StoreException {
+		Item item = find(id);
+		if (item == null) {
+			throw new StoreService.StoreException(404, "No such item");
+		}
+		if (!STATUS_HIDDEN.equals(item.status)) {
+			throw new StoreService.StoreException(409, "Only hidden items can be deleted - hide it first");
+		}
+		if (data.bundles != null && data.bundles.stream().anyMatch(b -> b.items != null && b.items.contains(id))) {
+			throw new StoreService.StoreException(409, "A bundle still contains it");
+		}
+		data.items.remove(item);
+		save();
+	}
+
+	public record AdminView(String featured, List<Collection> collections, List<Item> items, List<Bundle> bundles) {
+	}
+
+	/** Every item that isn't hidden (released and testing alike) - for the owner's "give everything" button. */
+	public synchronized List<String> visibleItemIds() {
+		List<String> out = new ArrayList<>();
+		for (Item i : data.items) {
+			if (!STATUS_HIDDEN.equals(i.status)) {
+				out.add(i.id);
+			}
+		}
+		return out;
+	}
+
+	public synchronized AdminView admin() {
+		List<Item> items = new ArrayList<>();
+		for (Item i : data.items) {
+			items.add(i.copy());
+		}
+		return new AdminView(data.featured, List.copyOf(data.collections), items, data.bundles == null ? List.of() : List.copyOf(data.bundles));
+	}
+
+	// ---- Files ----
+
+	/** The bytes of a stored file, or null. */
+	public byte[] file(String sha256) throws IOException {
+		if (sha256 == null || !SHA256.matcher(sha256).matches()) {
+			return null;
+		}
+		Path path = filesDir.resolve(sha256);
+		return Files.exists(path) ? Files.readAllBytes(path) : null;
+	}
+
+	/** A stored art file on disk: streamed to clients, never read into memory per request. */
+	public record FileRef(java.nio.file.Path path, long size, String contentType) {
+	}
+
+	/** Content types by sha256 (files never change, so each is sniffed once). */
+	private final java.util.Map<String, String> fileTypes = new java.util.concurrent.ConcurrentHashMap<>();
+
+	public FileRef fileRef(String sha256) throws IOException {
+		if (sha256 == null || !SHA256.matcher(sha256).matches()) {
+			return null;
+		}
+		Path path = filesDir.resolve(sha256);
+		if (!Files.exists(path)) {
+			return null;
+		}
+		String type = fileTypes.get(sha256);
+		if (type == null) {
+			type = contentType(Files.readAllBytes(path));
+			if (fileTypes.size() < 20_000) {
+				fileTypes.put(sha256, type);
+			}
+		}
+		return new FileRef(path, Files.size(path), type);
+	}
+
+	public static String contentType(byte[] bytes) {
+		if (bytes.length >= 4 && bytes[0] == (byte) 0x89 && bytes[1] == 'P' && bytes[2] == 'N' && bytes[3] == 'G') {
+			return "image/png";
+		}
+		if (bytes.length >= 4 && bytes[0] == 'G' && bytes[1] == 'I' && bytes[2] == 'F' && bytes[3] == '8') {
+			return "image/gif";
+		}
+		if (bytes.length >= 3 && bytes[0] == (byte) 0xFF && bytes[1] == (byte) 0xD8 && bytes[2] == (byte) 0xFF) {
+			return "image/jpeg";   // pet preview sheets
+		}
+		if (isEmoteAnimation(bytes)) {
+			return "application/json";
+		}
+		return "application/octet-stream";
+	}
+
+	/** An emote animation (tools/cosmetics/emotes/import_emotes.py): JSON with "frames" and "fps". */
+	static boolean isEmoteAnimation(byte[] bytes) {
+		if (bytes.length < 2 || bytes[0] != '{' || bytes.length > 4 * 1024 * 1024) {
+			return false;
+		}
+		try {
+			com.google.gson.JsonObject json = com.google.gson.JsonParser.parseString(new String(bytes, StandardCharsets.UTF_8)).getAsJsonObject();
+			return json.has("frames") && json.get("frames").isJsonArray() && json.has("fps");
+		} catch (RuntimeException e) {
+			return false;
+		}
+	}
+
+	/** Stores an uploaded file (PNG, GIF, a wing or bodywear mesh or an emote animation only) and returns its sha256. */
+	public String storeFile(byte[] bytes) throws IOException, StoreService.StoreException {
+		boolean mesh = bytes.length >= 4 && bytes[0] == 'V' && (bytes[1] == 'M' && bytes[2] == 'S' && bytes[3] == 'H'
+				|| bytes[1] == 'P' && bytes[2] == 'R' && bytes[3] == 'P');
+		boolean emote = isEmoteAnimation(bytes);
+		if (bytes.length == 0 || bytes.length > MAX_FILE_BYTES || !mesh && !emote && contentType(bytes).startsWith("application/")) {
+			throw new StoreService.StoreException(400, "Only PNG, JPEG, GIF, .vmesh, .vprop or emote animation files up to 12 MB");
+		}
+		String sha;
+		try {
+			sha = HexFormat.of().formatHex(MessageDigest.getInstance("SHA-256").digest(bytes));
+		} catch (java.security.NoSuchAlgorithmException e) {
+			throw new IllegalStateException(e);
+		}
+		Path path = filesDir.resolve(sha);
+		if (!Files.exists(path)) {
+			Path tmp = Files.createTempFile(filesDir, "upload", ".tmp");
+			Files.write(tmp, bytes);
+			Files.move(tmp, path, StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE);
+		}
+		return sha;
+	}
+
+	// ---- Owner edits ----
+
+	/**
+	 * Adds or changes an item. Only the fields given are changed on an existing item (a null leaves
+	 * it as it is); {@code clearWindow} removes the time window. Files must already be uploaded.
+	 */
+	public synchronized Item upsert(Item change, boolean clearWindow) throws IOException, StoreService.StoreException {
+		if (change == null || change.id == null || !ITEM_ID.matcher(change.id).matches()) {
+			throw new StoreService.StoreException(400, "Item ids look like wings_<name>, cape_<name>, aura_<name>, emote_<name>, killfx_<name>, wear_<name> or pet_<name> (lowercase, digits, _ or -)");
+		}
+		Item item = find(change.id);
+		boolean created = item == null;
+		if (created) {
+			item = new Item();
+			item.id = change.id;
+			item.type = change.id.startsWith("wings_") ? "wings" : change.id.startsWith("aura_") ? "aura"
+					: change.id.startsWith("emote_") ? "emote" : change.id.startsWith("killfx_") ? "killfx" : change.id.startsWith("wear_") ? "wear" : change.id.startsWith("pet_") ? "pet" : "cape";
+			item.name = change.id;
+			item.description = "";
+			item.status = STATUS_TESTING;
+			item.files = new LinkedHashMap<>();
+			item.addedAt = System.currentTimeMillis();
+		}
+		if (change.type != null && !TYPES.contains(change.type)) {
+			throw new StoreService.StoreException(400, "type is wings, cape, aura or emote");
+		}
+		if (change.status != null) {
+			if (!STATUSES.contains(change.status)) {
+				throw new StoreService.StoreException(400, "status is released, testing or hidden");
+			}
+			item.status = change.status;
+		}
+		if (change.name != null && !change.name.isBlank()) {
+			item.name = change.name.strip();
+		}
+		if (change.description != null) {
+			item.description = change.description.strip();
+		}
+		if (change.price > 0) {
+			if (change.price > 1_000_000) {
+				throw new StoreService.StoreException(400, "Price is at most 1,000,000 coins");
+			}
+			item.price = change.price;
+		}
+		if (change.collection != null) {
+			if (change.collection.isBlank()) {
+				item.collection = null;
+			} else if (collection(change.collection) == null) {
+				throw new StoreService.StoreException(404, "No collection " + change.collection + " - create it first");
+			} else {
+				item.collection = change.collection;
+			}
+		}
+		if (clearWindow) {
+			item.availableFrom = null;
+			item.availableUntil = null;
+		}
+		if (change.availableFrom != null) {
+			item.availableFrom = change.availableFrom <= 0 ? null : change.availableFrom;
+		}
+		if (change.availableUntil != null) {
+			item.availableUntil = change.availableUntil <= 0 ? null : change.availableUntil;
+		}
+		if (change.accent != null) {
+			if (!change.accent.matches("#[0-9a-fA-F]{6}")) {
+				throw new StoreService.StoreException(400, "accent is a colour like #ff8a1f");
+			}
+			item.accent = change.accent.toLowerCase(Locale.ROOT);
+		}
+		if (change.slot != null) {
+			if (!WEAR_SLOTS.contains(change.slot)) {
+				throw new StoreService.StoreException(400, "slot is one of " + WEAR_SLOTS);
+			}
+			item.slot = change.slot;
+		}
+		if (change.model != null) {
+			item.model = change.model;
+		}
+		if (change.style != null) {
+			if (!Set.of("feathered", "bat", "crystal", "tentacle").contains(change.style)) {
+				throw new StoreService.StoreException(400, "style is feathered, bat, crystal or tentacle");
+			}
+			item.style = change.style;
+		}
+		if (change.scale != null) {
+			item.scale = Math.max(0.1f, Math.min(4f, change.scale));
+		}
+		if (change.glow != null) {
+			item.glow = change.glow;
+		}
+		if (change.unlock != null) {
+			item.unlock = change.unlock.isBlank() ? null : change.unlock;
+		}
+		if (change.offsetY != null) {
+			item.offsetY = Math.max(-1f, Math.min(1f, change.offsetY));
+		}
+		if (change.files != null && !change.files.isEmpty()) {
+			for (Map.Entry<String, String> file : change.files.entrySet()) {
+				if (file.getValue() == null || !SHA256.matcher(file.getValue()).matches() || !Files.exists(filesDir.resolve(file.getValue()))) {
+					throw new StoreService.StoreException(400, "Upload " + file.getKey() + " first (unknown file)");
+				}
+			}
+			item.files = new LinkedHashMap<>(item.files);
+			item.files.putAll(change.files);
+		}
+		// Auras and kill effects are drawn by code in the clients - no files.
+		List<String> required = "wings".equals(item.type) ? List.of("mesh", "texture") : "cape".equals(item.type) ? List.of("gif")
+				: "emote".equals(item.type) ? List.of("anim") : "pet".equals(item.type) ? List.of("sheet") : List.of();
+		for (String role : required) {
+			if (!item.files.containsKey(role)) {
+				throw new StoreService.StoreException(400, "A " + item.type + " item needs its " + role + " file");
+			}
+		}
+		if (created) {
+			if (item.price <= 0) {
+				item.price = 2500;
+			}
+			data.items.add(item);
+		}
+		save();
+		return item.copy();
+	}
+
+	public synchronized Collection upsertCollection(Collection change) throws IOException, StoreService.StoreException {
+		if (change == null || change.id == null || !COLLECTION_ID.matcher(change.id).matches()) {
+			throw new StoreService.StoreException(400, "Collection ids are lowercase letters, digits, _ or -");
+		}
+		Collection c = collection(change.id);
+		if (c == null) {
+			c = new Collection();
+			c.id = change.id;
+			c.name = change.id;
+			data.collections.add(0, c);
+		}
+		if (change.name != null && !change.name.isBlank()) {
+			c.name = change.name.strip();
+		}
+		if (change.tag != null && !change.tag.isBlank()) {
+			c.tag = change.tag.strip().toUpperCase(Locale.ROOT);
+		}
+		if (change.description != null) {
+			c.description = change.description.strip();
+		}
+		save();
+		return c;
+	}
+
+	/** The collection the store features (null = the newest one with something in the store). */
+	public synchronized void setFeatured(String collectionId) throws IOException, StoreService.StoreException {
+		if (collectionId != null && !collectionId.isBlank() && collection(collectionId) == null) {
+			throw new StoreService.StoreException(404, "No such collection");
+		}
+		data.featured = collectionId == null || collectionId.isBlank() ? null : collectionId;
+		save();
+	}
+
+	private void save() throws IOException {
+		Path tmp = dir.resolve("catalog.json.tmp");
+		Files.writeString(tmp, GSON.toJson(data), StandardCharsets.UTF_8);
+		Files.move(tmp, catalogFile, StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE);
+	}
+}

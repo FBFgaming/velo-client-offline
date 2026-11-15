@@ -1,0 +1,511 @@
+package net.veloclient.velo.client.redstone;
+
+import net.minecraft.client.MinecraftClient;
+import net.veloclient.velo.client.util.ClientCompat;
+import net.veloclient.velo.client.util.Keys;
+
+/**
+ * Redstone Mode controls.
+ *
+ * <p>Always (while the mode is on): R leaves, a Left Alt tap frees the mouse for the overlay
+ * (Alt+scroll switches tools), F7 freezes, F9 hides the overlay, K records / replays, End stops a
+ * running paste, and the arrow keys step ticks while frozen or scrub a replay. Middle click on a
+ * schematic preview block picks it from your inventory. Ctrl+L loads a schematic (saving is a button - Ctrl+S would fire while sprinting backwards).
+ *
+ * <p>Without editing rights (see {@link RedstoneMode#canEdit}) only Select exists: the slot selects an area to save.
+ *
+ * <p>Only while the Redstone slot is selected in the hotbar (every other slot plays normally):
+ * <ul>
+ *   <li>Select - left / right click set the corners; Shift+scroll grows or shrinks the side you
+ *   look at.</li>
+ *   <li>Move - look along an axis and scroll: forward moves the selection that way, backward
+ *   towards you; Shift+scroll rotates; left click / Enter applies, right click resets.</li>
+ *   <li>Copy - the same scrolling slides a duplicate; left click places it and the selection follows onto it, so the
+ *   next scroll places another one.</li>
+ *   <li>Stack - the same scrolling adds copies (backward = the other way); left click applies.</li>
+ *   <li>Move / Copy / Stack: right click with a preview out cancels and drops the selection, so scrolling goes back to the
+ *   hotbar; applying a move or stack drops it too.</li>
+ *   <li>Wire / Water - left click the start, right click the end, left click again builds.</li>
+ *   <li>Ctrl+C / Ctrl+X / Ctrl+V / Ctrl+Z / Ctrl+Y, Delete erases, Backspace clears / cancels.</li>
+ * </ul>
+ * A paste or a freshly loaded schematic follows the crosshair (Shift+scroll rotates); left click
+ * places / locks it, right click cancels.
+ */
+public final class RmInput {
+
+	private static final char[] CTRL_KEYS = {'C', 'X', 'V', 'Y', 'Z', 'L'};
+	private static final boolean[] WAS_DOWN = new boolean[CTRL_KEYS.length];
+	private static boolean deleteDown;
+	private static boolean enterDown;
+	private static boolean backspaceDown;
+	private static boolean scrollRegistered;
+	private static boolean altDown;
+	private static boolean altScrolled;
+	/** Ticks left in which a picked schematic block is kept in hand (see {@link #guardPick}). */
+	private static int pickGuard;
+	private static int pickRetries;
+
+	private RmInput() {
+	}
+
+	/** Every client tick. */
+	public static void tick() {
+		if (!scrollRegistered) {
+			scrollRegistered = true;
+			net.veloclient.velo.client.addon.ScrollHandlers.register(RmInput::wantsScroll, RmInput::onScroll);
+		}
+		DustAnalyzer.tick();
+		ClockTracker.tick();
+		RedstoneMode.tickSlot();
+		if (!RedstoneMode.active()) {
+			RmKeys.drain(RmKeys.CURSOR, RmKeys.FREEZE, RmKeys.HIDE, RmKeys.RECORD, RmKeys.CANCEL_JOB, RmKeys.TOOL_SELECT, RmKeys.TOOL_MOVE,
+					RmKeys.TOOL_COPY, RmKeys.TOOL_STACK, RmKeys.TOOL_WIRE, RmKeys.TOOL_WATER, RmKeys.STEP, RmKeys.BACK, RmKeys.PLAY, RmKeys.REWIND);
+			return;
+		}
+		guardPick();
+		RmAnalysis.tick();
+		Placements.tick();
+		Timeline.tick();
+		Wiring.tick();
+		boolean inScreen = ClientCompat.currentScreen() != null;
+		// Alt tap (press + release without scrolling) toggles the overlay cursor.
+		boolean alt = RmKeys.CURSOR.isPressed();
+		if (alt && !altDown) {
+			altScrolled = false;
+		}
+		if (!alt && altDown && !altScrolled && !inScreen) {
+			MinecraftClient.getInstance().setScreen(new RmCursorScreen());
+		}
+		altDown = alt;
+		RmKeys.drain(RmKeys.CURSOR);
+		if (inScreen) {
+			return;
+		}
+		if (!Timeline.replayOpen()) {
+			TickControls.tick(200);
+		}
+		while (RmKeys.FREEZE.wasPressed()) {
+			TickControls.toggleFreeze();
+		}
+		while (RmKeys.HIDE.wasPressed()) {
+			RedstoneMode.toggleOverlay();
+		}
+		while (RmKeys.RECORD.wasPressed()) {
+			Timeline.toggle();
+		}
+		while (RmKeys.CANCEL_JOB.wasPressed()) {
+			RmJobs.cancelCurrent();
+		}
+		toolKey(RmKeys.TOOL_SELECT, RmState.Tool.SELECT);
+		toolKey(RmKeys.TOOL_MOVE, RmState.Tool.MOVE);
+		toolKey(RmKeys.TOOL_COPY, RmState.Tool.COPY);
+		toolKey(RmKeys.TOOL_STACK, RmState.Tool.STACK);
+		toolKey(RmKeys.TOOL_WIRE, RmState.Tool.WIRE);
+		toolKey(RmKeys.TOOL_WATER, RmState.Tool.WATER);
+		boolean held = RedstoneMode.toolHeld();
+		boolean ctrl = RmKeys.ctrl();
+		for (int i = 0; i < CTRL_KEYS.length; i++) {
+			boolean down = Keys.isKeyDown(Keys.letter(CTRL_KEYS[i]));
+			boolean file = CTRL_KEYS[i] == 'L';
+			if (down && !WAS_DOWN[i] && ctrl && (held || file)) {
+				onCtrl(CTRL_KEYS[i]);
+			}
+			WAS_DOWN[i] = down;
+		}
+		boolean delete = Keys.isKeyDown(Keys.DELETE);
+		if (delete && !deleteDown && held) {
+			RmOps.erase();
+		}
+		deleteDown = delete;
+		boolean enter = Keys.isKeyDown(Keys.ENTER);
+		if (enter && !enterDown && held) {
+			confirm();
+		}
+		enterDown = enter;
+		boolean backspace = Keys.isKeyDown(Keys.BACKSPACE);
+		if (backspace && !backspaceDown && held) {
+			cancelOrClear();
+		}
+		backspaceDown = backspace;
+	}
+
+	private static void toolKey(net.minecraft.client.option.KeyBinding key, RmState.Tool tool) {
+		while (key.wasPressed()) {
+			RedstoneMode.selectTool(tool);
+		}
+	}
+
+	private static void onCtrl(char key) {
+		switch (key) {
+			case 'C' -> RmOps.copy(false);
+			case 'X' -> RmOps.copy(true);
+			case 'V' -> startPaste();
+			case 'Z' -> RmOps.undo();
+			case 'Y' -> RmOps.redo();
+			case 'L' -> MinecraftClient.getInstance().setScreen(new SchematicPickScreen(null));
+			default -> {
+			}
+		}
+	}
+
+	/** Opens the save dialog for the selection (the toolbar's Save button). */
+	public static void saveSelection() {
+		if (RmState.hasSelection()) {
+			MinecraftClient.getInstance().setScreen(new SchematicSaveScreen());
+		} else {
+			RedstoneMode.selectTool(RmState.Tool.SELECT);
+			RmState.error("Select an area first - left click one corner, right click the other");
+		}
+	}
+
+	public static void startPaste() {
+		if (!RedstoneMode.canEdit()) {
+			RmState.error("Pasting needs singleplayer creative");
+			return;
+		}
+		if (RmOps.clipboard() == null) {
+			RmState.error("Clipboard is empty - copy a selection first (Ctrl+C)");
+			return;
+		}
+		RmState.pasting = true;
+		RmState.pasteRotation = 0;
+		RmState.pasteMirror = false;
+		RmState.info("Aim and left click to paste  ·  Shift+scroll rotates  ·  right click cancels");
+	}
+
+	/** The axis you look along, as a face (up/down when looking steeply). */
+	static int lookFace() {
+		double[] look = RmWorld.eyeAndLook();
+		if (look == null) {
+			return 2;
+		}
+		double ax = Math.abs(look[3]);
+		double ay = Math.abs(look[4]);
+		double az = Math.abs(look[5]);
+		if (ay >= ax && ay >= az) {
+			return look[4] > 0 ? 1 : 0;
+		}
+		if (ax >= az) {
+			return look[3] > 0 ? 5 : 4;
+		}
+		return look[5] > 0 ? 3 : 2;
+	}
+
+	/** Minimum corner where the clipboard paste would land (on the face you look at), or null. */
+	static int[] pasteOrigin(Clip clip) {
+		int[] look = RmWorld.lookedBlock(128);
+		if (clip == null || look == null) {
+			return null;
+		}
+		int[] d = RmWorld.faceOffset(look[3]);
+		int y = look[3] == 0 ? look[1] - clip.sy : look[1] + d[1];
+		return new int[] {look[0] + d[0] - clip.sx / 2, y, look[2] + d[2] - clip.sz / 2};
+	}
+
+	private static void confirm() {
+		if (RmState.pasting) {
+			Clip clip = RmOps.clipboard();
+			if (clip != null) {
+				Clip turned = clip.transformed(RmState.pasteRotation, RmState.pasteMirror);
+				int[] origin = pasteOrigin(turned);
+				if (origin != null) {
+					RmOps.paste(turned, origin[0], origin[1], origin[2]);
+				}
+			}
+			RmState.pasting = false;
+			return;
+		}
+		switch (RmState.tool) {
+			case MOVE -> RmOps.applyMove();
+			case COPY -> RmOps.applyCopy();
+			case STACK -> RmOps.applyStack();
+			case WIRE, WATER -> Wiring.build();
+			default -> {
+			}
+		}
+	}
+
+	private static void cancelOrClear() {
+		if (RmState.pasting) {
+			RmState.pasting = false;
+		} else if (!Wiring.preview().isEmpty() || RmState.wireStart != null) {
+			Wiring.reset();
+		} else if (RmState.moveActive() || RmState.stackCopies() != 0) {
+			RmState.resetTransforms();
+		} else {
+			RmState.clearSelection();
+		}
+	}
+
+	// ---- mouse (from RedstoneClickMixin) ----
+
+	/** Left click; true when Redstone Mode used it. */
+	public static boolean onAttack() {
+		if (!RedstoneMode.active() || ClientCompat.currentScreen() != null) {
+			return false;
+		}
+		Placements.Placement following = Placements.following();
+		if (following != null) {
+			following.locked = true;
+			RmState.info("Schematic locked in place - it stays until you remove it in the Schematics panel");
+			return true;
+		}
+		if (!RedstoneMode.toolHeld()) {
+			return false;
+		}
+		if (RmState.pasting) {
+			confirm();
+			return true;
+		}
+		switch (RmState.tool) {
+			case SELECT -> {
+				int[] look = RmWorld.lookedBlock(256);
+				if (look != null) {
+					RmState.cornerA = new int[] {look[0], look[1], look[2]};
+					RmState.resetTransforms();
+				}
+			}
+			case MOVE, COPY, STACK -> {
+				// Select first (left/right click the corners, as often as you like); once you've scrolled a
+				// preview out, left click applies it. Copy: a second left click without scrolling finishes.
+				if (RmState.moveActive() || RmState.stackCopies() != 0) {
+					confirm();
+				} else if (RmState.tool == RmState.Tool.COPY && RmState.copyPlaced) {
+					RmState.clearSelection();
+					RmState.info("Copying done");
+				} else {
+					int[] look = RmWorld.lookedBlock(256);
+					if (look != null) {
+						RmState.cornerA = new int[] {look[0], look[1], look[2]};
+						if (RmState.cornerB == null) {
+							RmState.cornerB = RmState.cornerA;
+						}
+					}
+				}
+			}
+			case WIRE, WATER -> {
+				if (!Wiring.preview().isEmpty()) {
+					Wiring.build();
+				} else {
+					int[] look = RmWorld.lookedBlock(256);
+					if (look != null) {
+						RmState.wireStart = look;
+						RmState.wireEnd = null;
+						Wiring.clearPreview();
+					}
+				}
+			}
+		}
+		return true;
+	}
+
+	public static boolean blocksBreaking() {
+		return RedstoneMode.active() && ClientCompat.currentScreen() == null && (RedstoneMode.toolHeld() || Placements.following() != null);
+	}
+
+	/** Right click. */
+	public static boolean onUse() {
+		if (!RedstoneMode.active() || ClientCompat.currentScreen() != null) {
+			return false;
+		}
+		Placements.Placement following = Placements.following();
+		if (following != null) {
+			Placements.remove(following);
+			return true;
+		}
+		if (!RedstoneMode.toolHeld()) {
+			return false;
+		}
+		if (RmState.pasting) {
+			RmState.pasting = false;
+			return true;
+		}
+		switch (RmState.tool) {
+			case SELECT -> {
+				int[] look = RmWorld.lookedBlock(256);
+				if (look != null) {
+					RmState.cornerB = new int[] {look[0], look[1], look[2]};
+					if (RmState.cornerA == null) {
+						RmState.cornerA = RmState.cornerB;
+					}
+					RmState.resetTransforms();
+				}
+			}
+			case MOVE, COPY, STACK -> {
+				// Right click: cancel the preview and drop the selection (scrolling goes back to the hotbar) - or, with
+				// no preview out, set the second corner.
+				if (RmState.moveActive() || RmState.stackCopies() != 0 || RmState.tool == RmState.Tool.COPY && RmState.copyPlaced) {
+					boolean done = RmState.copyPlaced && !RmState.moveActive();
+					RmState.clearSelection();
+					RmState.info(done ? "Copying done" : "Cancelled");
+				} else {
+					int[] look = RmWorld.lookedBlock(256);
+					if (look != null) {
+						RmState.cornerB = new int[] {look[0], look[1], look[2]};
+						if (RmState.cornerA == null) {
+							RmState.cornerA = RmState.cornerB;
+						}
+					}
+				}
+			}
+			case WIRE, WATER -> {
+				int[] look = RmWorld.lookedBlock(256);
+				if (look == null) {
+					return true;
+				}
+				if (RmState.wireStart == null) {
+					RmState.error("Left click the start first");
+				} else {
+					RmState.wireEnd = look;
+					Wiring.plan(RmState.tool == RmState.Tool.WATER);
+				}
+			}
+		}
+		return true;
+	}
+
+	/** Middle click; true when it picked a schematic block. */
+	public static boolean onPick() {
+		if (!RedstoneMode.active() || ClientCompat.currentScreen() != null) {
+			return false;
+		}
+		if (pickGuard > 3) {
+			return true; // a second pick right on the heels of one (doubled click) would grab the world block instead
+		}
+		if (!Placements.pickLooked()) {
+			pickGuard = 0; // a normal pick of a real block - don't switch that back
+			return false;
+		}
+		RedstoneMode.setToolSlot(false);
+		pickGuard = 6;
+		pickRetries = 0;
+		return true;
+	}
+
+	/**
+	 * For a few ticks after a schematic pick, keeps that block in hand: something else switching the slot straight back
+	 * (vanilla / Litematica pick block firing on the same click, a server resync) gets undone. A hotbar key ends it.
+	 */
+	private static void guardPick() {
+		if (pickGuard <= 0) {
+			return;
+		}
+		pickGuard--;
+		Object picked = Placements.lastPicked;
+		if (picked == null || RmWorld.hotbarKeysDown() != 0 || ClientCompat.currentScreen() != null) {
+			pickGuard = 0;
+			return;
+		}
+		if (!RmWorld.holdsPickOf(picked) && pickRetries < 2) {
+			pickRetries++;
+			RmWorld.pickItem(picked);
+			RedstoneMode.setToolSlot(false);
+		}
+	}
+
+	// ---- scroll ----
+
+	private static boolean wantsScroll() {
+		if (!RedstoneMode.active() || ClientCompat.currentScreen() != null) {
+			return false;
+		}
+		if (RmKeys.CURSOR.isPressed()) {
+			return true;
+		}
+		if (Placements.following() != null && RmKeys.shift()) {
+			return true;
+		}
+		return toolWantsScroll() || !RmWorld.spectator() && RedstoneMode.scrollReachesToolSlot();
+	}
+
+	/** Whether the selected tool uses this scroll itself (otherwise it moves through the hotbar). */
+	private static boolean toolWantsScroll() {
+		if (!RedstoneMode.toolHeld()) {
+			return false;
+		}
+		if (RmState.pasting) {
+			return RmKeys.shift();
+		}
+		return switch (RmState.tool) {
+			case SELECT -> RmKeys.shift() && RmState.hasSelection();
+			case MOVE, COPY, STACK -> RmState.hasSelection();
+			default -> false;
+		};
+	}
+
+	private static void onScroll(double amount) {
+		int step = amount > 0 ? 1 : -1;
+		if (RmKeys.CURSOR.isPressed()) {
+			altScrolled = true;
+			RmState.Tool[] tools = RedstoneMode.tools();
+			int at = java.util.Arrays.asList(tools).indexOf(RmState.tool);
+			RedstoneMode.selectTool(tools[Math.floorMod(Math.max(0, at) - step, tools.length)]);
+			return;
+		}
+		Placements.Placement following = Placements.following();
+		if (following != null && RmKeys.shift()) {
+			following.rotation = Math.floorMod(following.rotation + step, 4);
+			return;
+		}
+		if (!toolWantsScroll()) {
+			// Plain hotbar scrolling, with the tool slot between slot 9 and slot 1.
+			if (!RedstoneMode.scrollHotbar(amount)) {
+				RmWorld.setSelectedSlot(Math.floorMod(RmWorld.selectedSlot() - step, 9));
+			}
+			return;
+		}
+		if (RmState.pasting) {
+			RmState.pasteRotation = Math.floorMod(RmState.pasteRotation + step, 4);
+			return;
+		}
+		int face = lookFace();
+		int[] d = RmWorld.faceOffset(face);
+		switch (RmState.tool) {
+			case SELECT -> grow(face, step);
+			case MOVE, COPY -> {
+				if (RmKeys.shift()) {
+					RmState.moveRotation = Math.floorMod(RmState.moveRotation + step, 4);
+				} else {
+					RmState.moveOffset = new int[] {RmState.moveOffset[0] + d[0] * step, RmState.moveOffset[1] + d[1] * step,
+							RmState.moveOffset[2] + d[2] * step};
+				}
+			}
+			case STACK -> {
+				// Scrolling adds copies along the axis you look at (backward = the other way); the
+				// other axes keep their counts, so X, Y and Z can all be stacked in one go.
+				int axis = d[0] != 0 ? 0 : d[1] != 0 ? 1 : 2;
+				int next = Math.max(-256, Math.min(256, RmState.stack[axis] + d[axis] * step));
+				int[] trial = RmState.stack.clone();
+				trial[axis] = next;
+				long copies = (long) (Math.abs(trial[0]) + 1) * (Math.abs(trial[1]) + 1) * (Math.abs(trial[2]) + 1) - 1;
+				if (copies > 4096) {
+					RmState.error("That's over 4096 copies - apply this stack first");
+				} else {
+					RmState.stack = trial;
+				}
+			}
+			default -> {
+			}
+		}
+	}
+
+	/** Shift+scroll with Select: moves the selection's side you look at outwards (scroll forward) or inwards. */
+	private static void grow(int face, int step) {
+		int[] b = RmState.box();
+		if (b == null) {
+			return;
+		}
+		int[] d = RmWorld.faceOffset(face);
+		int[] min = {b[0], b[1], b[2]};
+		int[] max = {b[3], b[4], b[5]};
+		for (int a = 0; a < 3; a++) {
+			if (d[a] > 0) {
+				max[a] = Math.max(min[a], max[a] + step);
+			} else if (d[a] < 0) {
+				min[a] = Math.min(max[a], min[a] - step);
+			}
+		}
+		RmState.cornerA = min;
+		RmState.cornerB = max;
+	}
+}

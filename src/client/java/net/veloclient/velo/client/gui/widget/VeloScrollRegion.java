@@ -1,0 +1,426 @@
+package net.veloclient.velo.client.gui.widget;
+
+import net.minecraft.client.gui.DrawContext;
+import net.minecraft.client.gui.widget.ClickableWidget;
+import net.veloclient.velo.client.theme.Theme;
+import net.veloclient.velo.client.theme.ThemeManager;
+
+import java.util.ArrayList;
+import java.util.List;
+
+/**
+ * A scrollable viewport for a vertical stack of {@link ClickableWidget}s.
+ * Vanilla's widget system has no built-in scrolling container, so this
+ * tracks an offset, repositions/clips child widgets into a fixed screen
+ * rectangle each frame, and draws a minimal accent scrollbar. Widgets
+ * scrolled outside the viewport are pushed far off-screen (not just outside
+ * the scissor rect) so they can never intercept a click meant for something
+ * else drawn at the same screen coordinates outside this region.
+ */
+public final class VeloScrollRegion {
+
+	private static final int OFFSCREEN_Y = -10_000;
+	private static final int SCROLLBAR_WIDTH = 3;
+
+	private final int x;
+	private final int y;
+	private final int width;
+	private final int height;
+	private final List<ClickableWidget> rows = new ArrayList<>();
+	/** Where the content should scroll to... */
+	private double scrollOffset;
+	/** ...and where it's drawn right now - eased toward {@link #scrollOffset} every frame for smooth scrolling. */
+	private double shownOffset;
+	private Runnable lastLayout;
+	private long lastNanos;
+
+	public VeloScrollRegion(int x, int y, int width, int height) {
+		this.x = x;
+		this.y = y;
+		this.width = width;
+		this.height = height;
+		//? if <26.1 {
+		this.screen = net.minecraft.client.MinecraftClient.getInstance().currentScreen;
+		//?} else if <26.2 {
+		/*this.screen = net.minecraft.client.Minecraft.getInstance().screen;
+		*///?} else {
+		/*this.screen = net.minecraft.client.Minecraft.getInstance().gui.screen();
+		*///?}
+		LIVE.put(this, Boolean.TRUE);
+	}
+
+	/**
+	 * Scroll offsets of earlier regions, per screen: screens rebuild their widgets (and a new region) after every click -
+	 * equip, select, a store refresh - which used to throw the list back to the top. A new region on the same screen with
+	 * the same rectangle and the same number of rows (so not a different tab) carries on where the old one was.
+	 */
+	private static final java.util.Map<Object, java.util.Map<String, Double>> REMEMBERED = java.util.Collections.synchronizedMap(new java.util.WeakHashMap<>());
+	private final Object screen;
+	private boolean restored;
+
+	private String memoryKey() {
+		return x + "," + y + "," + width + "," + height + "#" + rows.size();
+	}
+
+	/** First layout: picks up the remembered offset; later: remembers the current one. */
+	private void remember() {
+		if (screen == null) {
+			return;
+		}
+		java.util.Map<String, Double> map = REMEMBERED.computeIfAbsent(screen, k -> new java.util.HashMap<>());
+		if (!restored) {
+			restored = true;
+			Double previous = map.get(memoryKey());
+			if (previous != null && scrollOffset == 0 && shownOffset == 0) {
+				scrollOffset = previous;
+				shownOffset = previous;
+			}
+		}
+		map.put(memoryKey(), scrollOffset);
+	}
+
+	/** Every region still referenced by a screen - lets VeloWindow clip clicks to them. */
+	private static final java.util.Map<VeloScrollRegion, Boolean> LIVE = java.util.Collections.synchronizedMap(new java.util.WeakHashMap<>());
+
+	/**
+	 * True when {@code element} is a row of some scroll region but the point lies outside that
+	 * region's visible rectangle - e.g. the hidden lower half of a partly scrolled-in tile sitting
+	 * under the window's bottom buttons. Such clicks must not reach the row.
+	 */
+	public static boolean clipsClick(Object element, double mouseX, double mouseY) {
+		synchronized (LIVE) {
+			for (VeloScrollRegion region : LIVE.keySet()) {
+				if (region.rows.contains(element)) {
+					return !region.contains(mouseX, mouseY);
+				}
+			}
+		}
+		return false;
+	}
+
+	public void clearRows() {
+		rows.clear();
+	}
+
+	/** Current scroll offset, so a caller can preserve it across a rebuild (e.g. {@code layoutContent()} after a button click) instead of it silently resetting to the top. */
+	public double scrollOffset() {
+		return scrollOffset;
+	}
+
+	public void setScrollOffset(double scrollOffset) {
+		this.scrollOffset = Math.max(0, scrollOffset);
+		this.shownOffset = this.scrollOffset;
+		this.restored = true; // the caller decides
+	}
+
+	/** Copy of the current rows, for removing them from a Screen's child list before rebuilding. */
+	public List<ClickableWidget> rowsSnapshot() {
+		return List.copyOf(rows);
+	}
+
+	/** Registers a widget as a row; its x/width are left as-is, its y is managed by this region. */
+	public void addRow(ClickableWidget widget) {
+		rows.add(widget);
+	}
+
+	public int viewportWidth() {
+		return width - SCROLLBAR_WIDTH - 4;
+	}
+
+	public int x() {
+		return x;
+	}
+
+	/** Lays out rows top-to-bottom starting at the region's top, each {@code rowHeight} tall with {@code gap} between. */
+	public void layout(int rowHeight, int gap) {
+		lastLayout = () -> layout(rowHeight, gap);
+		remember();
+		int contentHeight = rows.isEmpty() ? 0 : rows.size() * (rowHeight + gap) - gap;
+		int maxScroll = Math.max(0, contentHeight - height);
+		scrollOffset = Math.max(0, Math.min(scrollOffset, maxScroll));
+		shownOffset = Math.max(0, Math.min(shownOffset, maxScroll));
+
+		int cursor = y - (int) Math.round(shownOffset);
+		for (ClickableWidget row : rows) {
+			// Rendered (scissor-clipped) as soon as there's any overlap at
+			// all, but only made *clickable* once at least a quarter of the
+			// row is actually visible - a row barely poking into the
+			// viewport by a pixel or two used to still count as "active"
+			// with its full hitbox, which could overlap and steal clicks
+			// meant for something below the scroll region entirely
+			// (e.g. a "Done" button) until scrolled well past it.
+			boolean overlaps = cursor + rowHeight > y && cursor < y + height;
+			int visibleTop = Math.max(cursor, y);
+			int visibleBottom = Math.min(cursor + rowHeight, y + height);
+			boolean sufficientlyVisible = (visibleBottom - visibleTop) >= rowHeight * 0.25;
+			row.setY(overlaps ? cursor : OFFSCREEN_Y);
+			row.visible = overlaps;
+			row.active = overlaps && sufficientlyVisible;
+			cursor += rowHeight + gap;
+		}
+	}
+
+	/** Renders every row clipped to this region's rectangle, so a row that's only partially inside gets cut off cleanly instead of spilling past the edge. */
+	public void renderRows(DrawContext context, int mouseX, int mouseY, float delta) {
+		if (width <= 0 || height <= 0) {
+			return; // squeezed to nothing (tiny window / huge GUI scale) - nothing can be visible
+		}
+		animate();
+		renderScissorStart(context);
+		for (ClickableWidget row : rows) {
+			if (row.visible) {
+				row.render(context, mouseX, mouseY, delta);
+			}
+		}
+		renderScissorEnd(context);
+	}
+
+	/**
+	 * Lays out cells in a wrapping grid (Lunar/Feather-style module tiles)
+	 * instead of a single column - {@code columns} per row, each
+	 * {@code cellWidth}x{@code cellHeight}, {@code gap} between both axes.
+	 */
+	public void layoutGrid(int columns, int cellWidth, int cellHeight, int gap) {
+		int requestedColumns = columns;
+		lastLayout = () -> layoutGrid(requestedColumns, cellWidth, cellHeight, gap);
+		remember();
+		columns = Math.max(1, columns);
+		int rowCount = (int) Math.ceil(rows.size() / (double) columns);
+		int contentHeight = rowCount == 0 ? 0 : rowCount * (cellHeight + gap) - gap;
+		int maxScroll = Math.max(0, contentHeight - height);
+		scrollOffset = Math.max(0, Math.min(scrollOffset, maxScroll));
+		shownOffset = Math.max(0, Math.min(shownOffset, maxScroll));
+
+		for (int i = 0; i < rows.size(); i++) {
+			ClickableWidget cell = rows.get(i);
+			int col = i % columns;
+			int row = i / columns;
+			int cellX = x + col * (cellWidth + gap);
+			int cellY = y - (int) Math.round(shownOffset) + row * (cellHeight + gap);
+			boolean overlaps = cellY + cellHeight > y && cellY < y + height;
+			int visibleTop = Math.max(cellY, y);
+			int visibleBottom = Math.min(cellY + cellHeight, y + height);
+			boolean sufficientlyVisible = (visibleBottom - visibleTop) >= cellHeight * 0.25;
+			cell.setX(cellX);
+			cell.setY(overlaps ? cellY : OFFSCREEN_Y);
+			cell.visible = overlaps;
+			cell.active = overlaps && sufficientlyVisible;
+		}
+	}
+
+	/**
+	 * Lays rows out at fixed spots on a taller page - for pages of mixed sections (headings and banners drawn by the
+	 * screen, tiles as rows). {@code spots[i]} is row i's {x, y from the page top}; the page is {@code pageHeight} tall.
+	 * Draw the non-widget parts relative to {@link #pageTop()}.
+	 */
+	public void layoutPositioned(int[][] spots, int pageHeight) {
+		lastLayout = () -> layoutPositioned(spots, pageHeight);
+		this.pageHeight = pageHeight;
+		remember();
+		int maxScroll = Math.max(0, pageHeight - height);
+		scrollOffset = Math.max(0, Math.min(scrollOffset, maxScroll));
+		shownOffset = Math.max(0, Math.min(shownOffset, maxScroll));
+		for (int i = 0; i < rows.size() && i < spots.length; i++) {
+			ClickableWidget row = rows.get(i);
+			int rowY = pageTop() + spots[i][1];
+			int rowH = row.getHeight();
+			boolean overlaps = rowY + rowH > y && rowY < y + height;
+			int visible = Math.min(rowY + rowH, y + height) - Math.max(rowY, y);
+			row.setX(spots[i][0]);
+			row.setY(overlaps ? rowY : OFFSCREEN_Y);
+			row.visible = overlaps;
+			row.active = overlaps && visible >= rowH * 0.25;
+		}
+	}
+
+	private int pageHeight;
+
+	/** Where the top of a {@link #layoutPositioned} page is drawn right now. */
+	public int pageTop() {
+		return y - (int) Math.round(shownOffset);
+	}
+
+	/** The scrollbar for a {@link #layoutPositioned} page. */
+	public void renderScrollbarPage(DrawContext context) {
+		if (pageHeight > height) {
+			drawScrollbar(context, pageHeight);
+		}
+	}
+
+	public void renderScrollbarGrid(DrawContext context, int columns, int cellHeight, int gap) {
+		columns = Math.max(1, columns);
+		int rowCount = (int) Math.ceil(rows.size() / (double) columns);
+		int contentHeight = rowCount == 0 ? 0 : rowCount * (cellHeight + gap) - gap;
+		if (contentHeight <= height) {
+			return;
+		}
+		drawScrollbar(context, contentHeight);
+	}
+
+	public boolean scroll(double mouseX, double mouseY, double amount) {
+		if (!contains(mouseX, mouseY)) {
+			return false;
+		}
+		scrollOffset = Math.max(0, scrollOffset - amount * 22);
+		lastScrollNanos = System.nanoTime();
+		remember();
+		if (lastNanos == 0) {
+			// Owner draws rows itself (never calls renderRows), so nothing would ease the offset.
+			shownOffset = scrollOffset;
+		}
+		return true;
+	}
+
+	/** When any region last moved its content (wheel or easing). */
+	private static volatile long lastScrollNanos;
+
+	/**
+	 * True while some list is scrolling (and a moment after): animated tiles freeze their simulation meanwhile and just
+	 * redraw their last frame, so scrolling a page full of auras stays smooth.
+	 */
+	public static boolean scrolling() {
+		return System.nanoTime() - lastScrollNanos < 120_000_000L;
+	}
+
+	/** The part of the drawn offset below one GUI pixel, as a shift in GUI units snapped to whole screen pixels. */
+	private float subPixelShift() {
+		double rest = Math.round(shownOffset) - shownOffset;
+		int scale = Math.max(1, net.veloclient.velo.client.util.ClientCompat.guiScale());
+		return (float) (Math.round(rest * scale) / (double) scale);
+	}
+
+	/** Eases the drawn offset toward the target and re-lays-out rows while it moves. */
+	private void animate() {
+		long now = System.nanoTime();
+		float dt = VeloStyle.frameDelta(lastNanos, now);
+		lastNanos = now;
+		if (shownOffset != scrollOffset) {
+			lastScrollNanos = now;
+		}
+		if (Math.abs(shownOffset - scrollOffset) < 0.5 / Math.max(1, net.veloclient.velo.client.util.ClientCompat.guiScale())) {
+			if (shownOffset != scrollOffset) {
+				shownOffset = scrollOffset;
+				if (lastLayout != null) {
+					lastLayout.run();
+				}
+			}
+			return;
+		}
+		shownOffset = VeloAnim.step((float) shownOffset, (float) scrollOffset, dt * 1.5f);
+		if (lastLayout != null) {
+			lastLayout.run();
+		}
+	}
+
+	// ---- dragging the scrollbar (it was wheel-only) ----
+	private int barContent;
+	private long barDrawnAt;
+	private static VeloScrollRegion dragging;
+	private static double dragGrab;
+
+	private float thumbHeight(int contentHeight) {
+		return Math.max(18f, (float) height * height / contentHeight);
+	}
+
+	private float thumbY(int contentHeight) {
+		int maxScroll = contentHeight - height;
+		return y + (maxScroll > 0 ? (float) (shownOffset / maxScroll * (height - thumbHeight(contentHeight))) : 0f);
+	}
+
+	/** A press on a visible scrollbar of {@code screen} (track or thumb, a few pixels wide): starts dragging it. */
+	public static boolean pressScrollbar(Object screen, double mouseX, double mouseY) {
+		long now = System.nanoTime();
+		synchronized (LIVE) {
+			for (VeloScrollRegion r : LIVE.keySet()) {
+				if (r.screen != screen || r.barContent <= r.height || now - r.barDrawnAt > 250_000_000L) {
+					continue;
+				}
+				if (mouseX >= r.x + r.viewportWidth() + 1 && mouseX <= r.x + r.width + 2 && mouseY >= r.y && mouseY <= r.y + r.height) {
+					float thumbY = r.thumbY(r.barContent);
+					float thumbH = r.thumbHeight(r.barContent);
+					dragGrab = mouseY >= thumbY && mouseY <= thumbY + thumbH ? mouseY - thumbY : thumbH / 2f;
+					dragging = r;
+					r.dragTo(mouseY);
+					return true;
+				}
+			}
+		}
+		return false;
+	}
+
+	public static boolean dragScrollbar(double mouseY) {
+		if (dragging == null) {
+			return false;
+		}
+		dragging.dragTo(mouseY);
+		return true;
+	}
+
+	public static boolean releaseScrollbar() {
+		boolean was = dragging != null;
+		dragging = null;
+		return was;
+	}
+
+	private void dragTo(double mouseY) {
+		float thumbH = thumbHeight(barContent);
+		int maxScroll = barContent - height;
+		double t = (mouseY - dragGrab - y) / Math.max(1, height - thumbH);
+		scrollOffset = Math.max(0, Math.min(1, t)) * maxScroll;
+		lastScrollNanos = System.nanoTime();
+		remember();
+		if (lastNanos == 0) {
+			shownOffset = scrollOffset;
+		}
+	}
+
+	private void drawScrollbar(DrawContext context, int contentHeight) {
+		barContent = contentHeight;
+		barDrawnAt = System.nanoTime();
+		Theme theme = ThemeManager.active();
+		float trackX = x + width - SCROLLBAR_WIDTH;
+		float thumbHeight = Math.max(18f, (float) height * height / contentHeight);
+		int maxScroll = contentHeight - height;
+		float thumbY = y + (maxScroll > 0 ? (float) (shownOffset / maxScroll * (height - thumbHeight)) : 0f);
+		VeloDraw.fillRounded(context, trackX, y, SCROLLBAR_WIDTH, height, SCROLLBAR_WIDTH / 2f, VeloUi.withAlpha(theme.text(), 0x0C));
+		VeloDraw.fillRounded(context, trackX, thumbY, SCROLLBAR_WIDTH, thumbHeight, SCROLLBAR_WIDTH / 2f,
+				VeloUi.withAlpha(theme.text(), dragging == this ? 0x90 : 0x48));
+	}
+
+	private boolean contains(double mouseX, double mouseY) {
+		return mouseX >= x && mouseX <= x + width && mouseY >= y && mouseY <= y + height;
+	}
+
+	private boolean shifted;
+
+	/**
+	 * Clips to the region. Rows sit on whole GUI pixels (3 screen pixels at scale 3), so the eased offset used to move in
+	 * visible 3px steps: everything drawn until {@link #renderScissorEnd} (rows and the owner's headings alike) also gets
+	 * the rest of the offset as a pose shift snapped to real screen pixels, so every frame moves smoothly.
+	 */
+	public void renderScissorStart(DrawContext context) {
+		context.enableScissor(x, y, x + width, y + height);
+		float subPixel = subPixelShift();
+		shifted = subPixel != 0f;
+		if (shifted) {
+			context.getMatrices().pushMatrix();
+			context.getMatrices().translate(0f, subPixel);
+		}
+	}
+
+	public void renderScissorEnd(DrawContext context) {
+		if (shifted) {
+			context.getMatrices().popMatrix();
+			shifted = false;
+		}
+		context.disableScissor();
+	}
+
+	public void renderScrollbar(DrawContext context, int rowHeight, int gap) {
+		int contentHeight = rows.isEmpty() ? 0 : rows.size() * (rowHeight + gap) - gap;
+		if (contentHeight <= height) {
+			return;
+		}
+		drawScrollbar(context, contentHeight);
+	}
+}

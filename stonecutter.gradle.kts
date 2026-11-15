@@ -1,0 +1,1300 @@
+plugins {
+	id("dev.kikugie.stonecutter")
+}
+
+stonecutter active "1.21.11"
+
+// See https://stonecutter.kikugie.dev/wiki/config/params
+//
+// 26.1 ships Mojang's own official mappings instead of Yarn (Yarn has no
+// builds published for 26.1/26.2 at all - confirmed against
+// maven.fabricmc.net's real metadata). This block ports every Yarn-mapped
+// symbol this codebase uses over to its real Mojmap equivalent for 26.1+,
+// verified against the actual decompiled/javap'd 26.1 game jars rather than
+// guessed - Mojang's naming diverges from Yarn's on almost every touched
+// type (DrawContext -> GuiGraphicsExtractor, MinecraftClient -> Minecraft,
+// Text -> Component, etc.), not just a handful of renames.
+//
+// IMPORTANT about how `replace()` actually matches: it's a simultaneous,
+// non-overlapping multi-pattern matcher (Aho-Corasick), not a regex and NOT
+// word-boundary-aware - confirmed empirically (a naive bare "Text" ->
+// "Component" rule corrupted "drawTexture" into "drawComponenture" and
+// mangled a mixin's target method descriptor string). Two things follow:
+//   1. A LONGER registered pattern starting at the same or an earlier
+//      position always wins and "shields" everything inside it (e.g.
+//      registering "TextFieldWidget" separately protects it from the bare
+//      "Text" rule below it).
+//   2. Short/generic tokens ("Text", "Click") are NEVER used bare here -
+//      only in patterns specific enough that they can't appear inside an
+//      unrelated real API name (a Texture-related method, "onClick",
+//      "mouseClicked", etc).
+stonecutter parameters {
+	swaps["mod_version"] = "\"${property("mod.version")}\";"
+	swaps["minecraft"] = "\"${node.metadata.version}\";"
+	dependencies["fapi"] = node.project.property("deps.fabric_api") as String
+
+	replacements {
+		// 1.21.1: the GUI still draws with a 3D MatrixStack (1.21.6 made it a 2D Matrix3x2fStack). Forward-only (1.21.1 is
+		// never active): the regexes' reverse pattern "(?!x)x" never matches.
+		if (current.parsed < "1.21.2") {
+			string(true) {
+				replace(".pushMatrix()", ".push()")
+				replace(".popMatrix()", ".pop()")
+				replace("net.minecraft.client.gl.RenderPipelines", "net.veloclient.velo.client.compat.RenderPipelines")
+				// 1.21.9's input events: Velo's records (vanilla input reaches them through VeloWindow's bridges).
+				replace("net.minecraft.client.gui.Click", "net.veloclient.velo.client.compat.Click")
+				replace("net.minecraft.client.input.KeyInput", "net.veloclient.velo.client.compat.KeyInput")
+				replace("net.minecraft.client.input.CharInput", "net.veloclient.velo.client.compat.CharInput")
+				// Fabric's world render events moved to a .world package (and renamed the matrices) after 1.21.1.
+				replace("net.fabricmc.fabric.api.client.rendering.v1.world.WorldRenderEvents", "net.fabricmc.fabric.api.client.rendering.v1.WorldRenderEvents")
+				replace("net.fabricmc.fabric.api.client.rendering.v1.world.WorldRenderContext", "net.fabricmc.fabric.api.client.rendering.v1.WorldRenderContext")
+				replace("context.matrices()", "context.matrixStack()")
+				replace(".getEntityPos()", ".getPos()")
+				replace(".getCameraPos()", ".getPos()")
+				// Renamed in 1.21.2: world height, partial ticks; moved: particle setting, skin textures + model.
+				replace(".getTopYInclusive()", ".getTopY()")
+				replace(".getTickProgress(", ".getTickDelta(")
+				replace("net.minecraft.particle.ParticlesMode", "net.minecraft.client.option.ParticlesMode")
+				replace("net.minecraft.entity.player.SkinTextures", "net.minecraft.client.util.SkinTextures")
+				replace("net.minecraft.entity.player.PlayerSkinType", "net.minecraft.client.util.SkinTextures.Model")
+				replace("PlayerSkinType.", "net.minecraft.client.util.SkinTextures.Model.")
+				replace("com.mojang.blaze3d.buffers.GpuBuffer", "net.veloclient.velo.client.compat.GpuBuffer")
+				replace("net.fabricmc.fabric.api.client.rendering.v1.hud.HudElementRegistry", "net.veloclient.velo.client.compat.HudElementRegistry")
+				replace("net.fabricmc.fabric.api.client.rendering.v1.hud.VanillaHudElements", "net.veloclient.velo.client.compat.VanillaHudElements")
+				// Render states (1.21.2) and the command queue (1.21.9): Velo's stand-ins that draw immediately.
+				// Feature renderers were typed by the player entity, not a render state (longer pattern wins over the one below).
+				replace("net.minecraft.client.render.entity.state.PlayerEntityRenderState, net.minecraft.client.render.entity.model.PlayerEntityModel>",
+						"net.minecraft.client.network.AbstractClientPlayerEntity, net.minecraft.client.render.entity.model.PlayerEntityModel<net.minecraft.client.network.AbstractClientPlayerEntity>>")
+				replace("net.minecraft.client.render.entity.state.PlayerEntityRenderState", "net.veloclient.velo.client.compat.PlayerEntityRenderState")
+				replace("net.minecraft.client.render.command.OrderedRenderCommandQueue", "net.veloclient.velo.client.compat.OrderedRenderCommandQueue")
+				replace("context.commandQueue()", "net.veloclient.velo.client.compat.OrderedRenderCommandQueue.of(context.consumers())")
+				// Hotbar slot was a public field; particles, NBT text, slot overlay, data/pack version, registries, chunk checks.
+				replace("getInventory().getSelectedSlot()", "getInventory().selectedSlot")
+				replace("inventory.getSelectedSlot()", "inventory.selectedSlot")
+				replace("player.getInventory().setSelectedSlot(slot);", "player.getInventory().selectedSlot = slot;")
+				replace("player.getInventory().setSelectedSlot(0);", "player.getInventory().selectedSlot = 0;")
+				replace("inventory.setSelectedSlot(i);", "inventory.selectedSlot = i;")
+				replace(".addParticleClient(", ".addParticle(")
+				replace("StringNbtReader.readCompound(", "StringNbtReader.parse(")
+				replace(".drawStackOverlay(", ".drawItemInSlot(")
+				replace("getGameVersion().dataVersion().id()", "getGameVersion().getSaveVersion().getId()")
+				replace("getGameVersion().packVersion(net.minecraft.resource.ResourceType.CLIENT_RESOURCES).major()", "getGameVersion().getResourceVersion(net.minecraft.resource.ResourceType.CLIENT_RESOURCES)")
+				replace(".isOpaqueFullCube()", ".isOpaqueFullCube(net.minecraft.world.EmptyBlockView.INSTANCE, net.minecraft.util.math.BlockPos.ORIGIN)")
+				replace(".isPosLoaded(", ".isChunkLoaded(")
+				replace("getRegistryManager().getOrThrow(", "getRegistryManager().get(")
+				// Widgets' children are vanilla Elements (numbers in 1.21.1); key categories were translation strings.
+				replace("child.mouseClicked(click, doubled)", "child.mouseClicked(click.x(), click.y(), click.button())")
+				replace("forward.onClick(click, doubled)", "forward.onClick(click.x(), click.y())")
+				replace("KeyBinding.Category CATEGORY", "String CATEGORY")
+				replace("binding.getId()", "binding.getTranslationKey()")
+				replace(".getDynamicDeltaTicks()", ".getLastFrameDuration()")
+				replace("com.mojang.blaze3d.pipeline.RenderPipeline pipeline", "Object pipeline")
+				replace("context.drawTexture(pipeline, texture,", "net.veloclient.velo.client.compat.GuiCompat.drawTexture(context, pipeline, texture,")
+				// Odds and ends with a direct 1.21.1 counterpart.
+				replace("var view = net.minecraft.storage.NbtWriteView.create(net.minecraft.util.ErrorReporter.EMPTY, w(level).getRegistryManager());", "var view = new net.minecraft.nbt.NbtCompound();")
+				replace("if (entity.saveSelfData(view)) {", "if (entity.saveSelfNbt(view)) {")
+				replace("entity.getYaw(), view.getNbt()}", "entity.getYaw(), view}")
+				replace("matrices.mul(new Matrix3x2f(", "net.veloclient.velo.client.compat.GuiCompat.mul(matrices, new Matrix3x2f(")
+				replace("client.joinWorld(session.world);", "client.joinWorld(session.world, net.minecraft.client.gui.screen.DownloadingTerrainScreen.WorldEntryReason.OTHER);")
+				replace("client.disconnectWithSavingScreen();", "client.disconnect();")
+				replace("client.getPacketApplyBatcher().apply();", "// (1.21.1 applies packets directly)")
+				replace("public void onFilesDropped(List<Path> paths) {", "public void filesDragged(List<Path> paths) {")
+				replace("images.get(current).getColorArgb(px, py)", "net.veloclient.velo.client.compat.ImageCompat.getColorArgb(images.get(current), px, py)")
+				replace("((net.minecraft.client.gui.screen.Screen) (Object) this).getTextRenderer()", "net.minecraft.client.MinecraftClient.getInstance().textRenderer")
+				replace("withFont(FONT)", "withFont(net.veloclient.velo.client.compat.StyleSpriteSource.id(FONT))")
+				replace("return MinecraftClient.getInstance().getWindow().getScaleFactor();", "return (int) MinecraftClient.getInstance().getWindow().getScaleFactor();")
+				replace("context.getMatrices().m00()", "context.getMatrices().peek().getPositionMatrix().m00()")
+				replace("binding.getCategory().id().toString()", "binding.getCategory()")
+				replace("binding.getCategory().getLabel().getString()", "net.minecraft.text.Text.translatable(binding.getCategory()).getString()")
+				replace("new net.minecraft.client.gui.screen.ChatScreen(\":fi\", false)", "new net.minecraft.client.gui.screen.ChatScreen(\":fi\")")
+				replace(".playSoundClient(", ".playSound(")
+				replace("Direction.fromHorizontalDegrees(", "Direction.fromRotation(")
+				replace("net.minecraft.entity.vehicle.AbstractBoatEntity", "net.minecraft.entity.vehicle.BoatEntity")
+				replace("PositionAndOnGround(x, y + 0.0625, z, false, collision)", "PositionAndOnGround(x, y + 0.0625, z, false)")
+				replace("PositionAndOnGround(x, y, z, false, collision)", "PositionAndOnGround(x, y, z, false)")
+				replace("player.getItemCooldownManager().isCoolingDown(stack)", "player.getItemCooldownManager().isCoolingDown(stack.getItem())")
+				replace("static void setCloudRange(int v) { o().getCloudRenderDistance().setValue(v); }", "static void setCloudRange(int v) { }")
+				replace("ColorHelper.fromFloats(", "ColorHelper.Argb.fromFloats(")
+				replace("server.getCommandManager().parseAndExecute(", "server.getCommandManager().executeWithPrefix(")
+				replace("import net.minecraft.client.render.DefaultFramebufferSet;", "// (1.21.1: no framebuffer sets)")
+				replace("import net.minecraft.client.render.fog.FogRenderer;", "// (1.21.1: fog came from BackgroundRenderer)")
+				// Skin previews: 1.21.1's skin provider / model loader names and SkinTextures record.
+				replace("supplySkinTextures(client.getGameProfile(), false)", "getSkinTexturesSupplier(client.getGameProfile())")
+				replace("currentSkin().body().texturePath()", "currentSkin().texture()")
+				replace("getLoadedEntityModels()", "getEntityModelLoader()")
+				replace("SkinTextures.create(new AssetInfo.TextureAssetInfo(id, id), null, null, slim.getAsBoolean() ? PlayerSkinType.SLIM : PlayerSkinType.WIDE)",
+						"new SkinTextures(id, null, null, null, slim.getAsBoolean() ? SkinTextures.Model.SLIM : SkinTextures.Model.WIDE, false)")
+				replace("import net.minecraft.util.AssetInfo;", "// (no AssetInfo before 1.21.9)")
+				// Storage Memory: villager data getters; no item model component (1.21.2) to remember.
+				replace("data.profession().getIdAsString(), data.level()", "\"minecraft:\" + data.getProfession().id(), data.getLevel()")
+				replace("var model = stack.get(net.minecraft.component.DataComponentTypes.ITEM_MODEL);", "Object model = null; // no item model component before 1.21.2")
+				replace("stack.set(net.minecraft.component.DataComponentTypes.ITEM_MODEL, key);", "// (1.21.1: no item model component)")
+				// Pack screen: the organizer's change callback took no pack; model layers had getters.
+				replace("ResourcePackOrganizer(pack -> onChanged.run(),", "ResourcePackOrganizer(() -> onChanged.run(),")
+				replace("l.id() + \"#\" + l.name()", "l.getId() + \"#\" + l.getName()")
+				// Entity: prev* positions and elytra flight before 1.21.2 renamed them last* / gliding.
+				replace("player.lastX", "player.prevX")
+				replace("player.lastY", "player.prevY")
+				replace("player.lastZ", "player.prevZ")
+				replace(".isGliding()", ".isFallFlying()")
+				// ModelPart: rotate() / pivot* before 1.21.2 renamed them applyTransform() / origin*.
+				replace(".applyTransform(", ".rotate(")
+				replace(".originX", ".pivotX")
+				replace(".originY", ".pivotY")
+				replace(".originZ", ".pivotZ")
+				// authlib before 1.21.9: GameProfile getters, not record accessors.
+				replace("getGameProfile().name()", "getGameProfile().getName()")
+				replace("getGameProfile().id()", "getGameProfile().getId()")
+				replace("getProfile().name()", "getProfile().getName()")
+				replace("getProfile().id()", "getProfile().getId()")
+				// Fonts: 1.21.1 styles hold the font Identifier itself (compat.StyleSpriteSource converts).
+				replace("net.minecraft.text.StyleSpriteSource", "net.veloclient.velo.client.compat.StyleSpriteSource")
+				replace("style.getFont()", "net.veloclient.velo.client.compat.StyleSpriteSource.of(style.getFont())")
+				replace(".withFont(marker(place, font, i, length))", ".withFont(net.veloclient.velo.client.compat.StyleSpriteSource.id(marker(place, font, i, length)))")
+			}
+			// FeatureRenderer.render(matrices, queue, light, state, limbAngle, limbDistance) -> 1.21.1's entity signature;
+			// the queue and the state are made at the top of the body so the rest stays as it is.
+			regex(true) { replace("public void render\\((?:net\\.minecraft\\.client\\.util\\.math\\.)?MatrixStack (\\w+), (?:[\\w.]*)OrderedRenderCommandQueue (\\w+), int (\\w+),\\s*(?:[\\w.]*)PlayerEntityRenderState (\\w+), float (\\w+), float (\\w+)\\) \\{",
+					"public void render(net.minecraft.client.util.math.MatrixStack $1, net.minecraft.client.render.VertexConsumerProvider veloConsumers, int $3, net.minecraft.client.network.AbstractClientPlayerEntity veloPlayer, float $5, float $6, float veloTickDelta, float veloAnimation, float veloHeadYaw, float veloHeadPitch) {\n\t\tvar $2 = net.veloclient.velo.client.compat.OrderedRenderCommandQueue.of(veloConsumers);\n\t\tvar $4 = net.veloclient.velo.client.compat.PlayerEntityRenderState.of(veloPlayer, veloTickDelta);",
+					"(?!x)x", "") }
+			// Widget click handlers: 1.21.1's onClick(x, y) - the event is rebuilt at the top so the body stays the same.
+			regex(true) { replace("public void onClick\\((?:net\\.minecraft\\.client\\.gui\\.)?Click (\\w+), boolean (\\w+)\\) \\{",
+					"public void onClick(double veloX, double veloY) {\n\t\tnet.veloclient.velo.client.compat.Click $1 = new net.veloclient.velo.client.compat.Click(veloX, veloY, 0);\n\t\tboolean $2 = false;", "(?!x)x", "") }
+			// KeyBinding.Category.create(Identifier.of("ns", "name")) -> the 1.21.1 category key string.
+			regex(true) { replace("KeyBinding\\.Category\\.create\\(Identifier\\.of\\(\"([^\"]+)\", \"([^\"]+)\"\\)\\)", "\"key.category.$1.$2\"", "(?!x)x", "") }
+			// GUI matrix rotate / multiply (Matrix3x2f) -> GuiCompat over 1.21.1's MatrixStack.
+			regex(true) { replace("([A-Za-z_][\\w$]*(?:\\.[A-Za-z_][\\w$]*)*)\\.getMatrices\\(\\)\\.(rotate|mul)\\(", "net.veloclient.velo.client.compat.GuiCompat.$2($1.getMatrices(), ", "(?!x)x", "") }
+			// DrawContext's text calls returned the end x (int) until 1.21.6: mixin descriptors end in I there.
+			regex(true) { replace("(drawText(?:WithShadow)?\\(Lnet/minecraft/client/font/TextRenderer;L[\\w/]+;IIIZ?\\))V", "$1I", "(?!x)x", "") }
+			regex(true) { replace("(int color, boolean shadow,\\s*)CallbackInfo ci\\)", "$1org.spongepowered.asm.mixin.injection.callback.CallbackInfoReturnable<Integer> ci)", "(?!x)x", "") }
+			// client.disconnect(Text) -> 1.21.1's disconnect(Screen) with a message screen.
+			regex(true) { replace("client\\.disconnect\\(((?:net\\.minecraft\\.text\\.)?Text\\.literal\\(\"[^\"]*\"\\))\\)", "client.disconnect(new net.minecraft.client.gui.screen.MessageScreen($1))", "(?!x)x", "") }
+			// NativeImageBackedTexture had no debug-name supplier before 1.21.4.
+			regex(true) { replace("new NativeImageBackedTexture\\(\\(\\) -> [^,]+?, ", "new NativeImageBackedTexture(", "(?!x)x", "") }
+			regex(true) { replace("super\\(name, (\\w+), (\\w+), false\\)", "super($1, $2, false)", "(?!x)x", "") }
+			// Style.withFont(new StyleSpriteSource.Font(id)) -> Style.withFont((id)) - the id is the font in 1.21.1.
+			regex(true) { replace("\\.withFont\\(new (?:[\\w.]+\\.)?StyleSpriteSource\\.Font\\(", ".withFont((", "(?!x)x", "") }
+			// NativeImage's ARGB accessors (1.21.2+) -> ImageCompat over 1.21.1's ABGR getColor / setColor.
+			regex(true) { replace("([A-Za-z_][\\w$]*(?:\\.[A-Za-z_][\\w$]*)*(?:\\[[^\\]]*\\])?)\\.(getColorArgb|setColorArgb)\\(", "net.veloclient.velo.client.compat.ImageCompat.$2($1, ", "(?!x)x", "") }
+			// Those handlers override nothing in 1.21.1's Screen: drop their @Override.
+			regex(true) { replace("@Override(\\s+public boolean (?:mouseClicked|mouseReleased|mouseDragged|keyPressed|keyReleased|charTyped)\\()(?=(?:final )?(?:[\\w.]+\\.)?(?:Click|KeyInput|CharInput)\\b)", "$1", "(?!x)x", "") }
+			// Texture draws with a pipeline (1.21.5+) go through GuiCompat (no pipeline, colour as shader colour).
+			regex(true) { replace("([A-Za-z_][\\w$]*(?:\\.[A-Za-z_][\\w$]*)*)\\.(drawTexture|drawGuiTexture)\\((?=\\s*(?:[\\w.]+\\.)?RenderPipelines\\.)", "net.veloclient.velo.client.compat.GuiCompat.$2($1, ", "(?!x)x", "") }
+			regex(true) { replace("\\.translate\\(((?:[^,()]|\\([^()]*\\))+),((?:[^,()]|\\([^()]*\\))+)\\)", ".translate($1,$2, 0)", "(?!x)x", "") }
+			regex(true) { replace("\\.scale\\(((?:[^,()]|\\([^()]*\\))+),((?:[^,()]|\\([^()]*\\))+)\\)", ".scale($1,$2, 1)", "(?!x)x", "") }
+		}
+		// 1.21.10 has no Gizmo system: the overlays use Velo's own stand-ins (render/gizmo). Older than the sources'
+		// version and never active, so this only ever runs forward.
+		if (current.parsed < "1.21.11") string(true) {
+			replace("net.minecraft.world.debug.gizmo.GizmoDrawing", "net.veloclient.velo.client.render.gizmo.GizmoDrawing")
+			replace("net.minecraft.world.debug.gizmo.TextGizmo", "net.veloclient.velo.client.render.gizmo.TextGizmo")
+			replace("net.minecraft.client.render.DrawStyle", "net.veloclient.velo.client.render.gizmo.DrawStyle")
+			// RenderLayers (the factory class) came in 1.21.11; before, the same layers were RenderLayer.get*().
+			replace("import net.minecraft.client.render.RenderLayers;", "import net.minecraft.client.render.RenderLayer;")
+			replace("RenderLayers.entityCutoutNoCull(", "RenderLayer.getEntityCutoutNoCull(")
+			replace("RenderLayers.entityTranslucent(", "RenderLayer.getEntityTranslucent(")
+			replace("RenderLayers.eyes(", "RenderLayer.getEyes(")
+			replace("RenderLayers.text(", "RenderLayer.getText(")
+			// PositionedSoundInstance.ui(...) was master(...) - same arguments.
+			replace("PositionedSoundInstance.ui(", "PositionedSoundInstance.master(")
+			replace("net.minecraft.client.util.memory.ObjectPool", "net.minecraft.client.util.Pool")
+			// The hand's re-equip height followed the attack cooldown directly.
+			replace("getHandEquippingProgress(", "getAttackCooldownProgress(")
+			replace("net.minecraft.entity.LoadedEntityProcessor.NOOP", "java.util.function.Function.identity()")
+			// 1.21.11 renamed the graphics mode option to "preset".
+			replace("options.getPreset()", "options.getGraphicsMode()")
+		}
+		// Only for versions at or after the sources' own (1.21.11): Stonecutter applies a false condition in REVERSE,
+		// which turned every Mojmap word back into Yarn in older versions (1.21.10's Map.Entry.getValue() -> getText()).
+		if (current.parsed >= "1.21.11") string(current.parsed >= "26.1") {
+
+			// --- Fully-qualified path swaps: package changed, simple name
+			// didn't. Safe as a blanket rule since the source pattern
+			// already includes the full package prefix, and (per the
+			// longer-match-wins rule) a same-named-but-longer sibling like
+			// "EntityType"/"Items"/"ItemStack" registered below always wins
+			// over a shorter prefix like "Entity"/"Item" at the same start
+			// position.
+			replace("net.minecraft.block.BlockState", "net.minecraft.world.level.block.state.BlockState")
+			replace("net.minecraft.block.entity.BlockEntity", "net.minecraft.world.level.block.entity.BlockEntity")
+			// Simple names unchanged, only the package moved (verified via javap on the real
+			// 26.1 common jar) - same "package changed, simple name didn't" case as BlockState/
+			// BlockEntity above.
+			replace("net.minecraft.block.ChestBlock", "net.minecraft.world.level.block.ChestBlock")
+			replace("net.minecraft.block.BarrelBlock", "net.minecraft.world.level.block.BarrelBlock")
+			replace("net.minecraft.block.ShulkerBoxBlock", "net.minecraft.world.level.block.ShulkerBoxBlock")
+			replace("net.minecraft.block.EnderChestBlock", "net.minecraft.world.level.block.EnderChestBlock")
+			replace("net.minecraft.block.SpawnerBlock", "net.minecraft.world.level.block.SpawnerBlock")
+			replace("net.minecraft.util.math.ChunkPos", "net.minecraft.world.level.ChunkPos")
+			replace("net.minecraft.client.gl.RenderPipelines", "net.minecraft.client.renderer.RenderPipelines")
+			replace("net.minecraft.client.gui.screen.narration.NarrationMessageBuilder", "net.minecraft.client.gui.narration.NarrationElementOutput")
+			replace("net.minecraft.client.gui.screen.narration.NarrationPart", "net.minecraft.client.gui.narration.NarratedElementType")
+			replace("net.minecraft.client.gui.screen.DeathScreen", "net.minecraft.client.gui.screens.DeathScreen")
+			replace("net.minecraft.client.gui.screen.GameMenuScreen", "net.minecraft.client.gui.screens.PauseScreen")
+			replace("net.minecraft.client.gui.screen.TitleScreen", "net.minecraft.client.gui.screens.TitleScreen")
+			replace("net.minecraft.client.gui.screen.Screen", "net.minecraft.client.gui.screens.Screen")
+			replace("net.minecraft.client.gui.widget.ClickableWidget", "net.minecraft.client.gui.components.AbstractWidget")
+			replace("net.minecraft.client.gui.widget.TextFieldWidget", "net.minecraft.client.gui.components.EditBox")
+			replace("net.minecraft.client.gui.hud.InGameHud", "net.minecraft.client.gui.Gui")
+			replace("net.minecraft.client.gui.hud.PlayerListHud", "net.minecraft.client.gui.components.PlayerTabOverlay")
+			replace("net.minecraft.client.gui.DrawContext", "net.minecraft.client.gui.GuiGraphicsExtractor")
+			replace("net.minecraft.client.gui.Click", "net.minecraft.client.input.MouseButtonEvent")
+			replace("net.minecraft.client.font.TextRenderer", "net.minecraft.client.gui.Font")
+			replace("net.minecraft.client.MinecraftClient", "net.minecraft.client.Minecraft")
+			replace("net.minecraft.client.Mouse", "net.minecraft.client.MouseHandler")
+			replace("net.minecraft.client.network.ClientPlayNetworkHandler", "net.minecraft.client.multiplayer.ClientPacketListener")
+			replace("net.minecraft.client.network.PlayerListEntry", "net.minecraft.client.multiplayer.PlayerInfo")
+			replace("net.minecraft.client.option.GameOptions", "net.minecraft.client.Options")
+			replace("net.minecraft.client.option.KeyBinding", "net.minecraft.client.KeyMapping")
+			replace("net.minecraft.client.option.CloudRenderMode", "net.minecraft.client.CloudStatus")
+			replace("net.minecraft.client.option.GraphicsMode", "net.minecraft.client.GraphicsPreset")
+			replace("net.minecraft.client.option.InactivityFpsLimit", "net.minecraft.client.InactivityFpsLimit")
+			replace("net.minecraft.client.render.command.OrderedRenderCommandQueue", "net.minecraft.client.renderer.OrderedRenderCommandQueue")
+			replace("net.minecraft.client.render.entity.EntityRendererFactory", "net.minecraft.client.renderer.entity.EntityRendererProvider")
+			replace("net.minecraft.client.render.entity.feature.FeatureRendererContext", "net.minecraft.client.renderer.entity.RenderLayerParent")
+			replace("net.minecraft.client.render.entity.feature.FeatureRenderer", "net.minecraft.client.renderer.entity.RenderLayer")
+			replace("net.minecraft.client.render.entity.model.EntityModelLayers", "net.minecraft.client.model.geom.ModelLayers")
+			replace("net.minecraft.client.render.entity.model.PlayerCapeModel", "net.minecraft.client.model.player.PlayerCapeModel")
+			replace("net.minecraft.client.render.entity.state.PlayerEntityRenderState", "net.minecraft.client.renderer.entity.state.PlayerRenderState")
+			replace("net.minecraft.client.render.GameRenderer", "net.minecraft.client.renderer.GameRenderer")
+			replace("net.minecraft.client.render.OverlayTexture", "net.minecraft.client.renderer.texture.OverlayTexture")
+			replace("net.minecraft.client.render.RenderLayers", "net.minecraft.client.renderer.RenderType")
+			replace("net.minecraft.client.render.RenderTickCounter", "net.minecraft.client.DeltaTracker")
+			replace("net.minecraft.client.render.Camera", "net.minecraft.client.Camera")
+			replace("net.minecraft.client.sound.SoundInstanceListener", "net.minecraft.client.sounds.SoundEventListener")
+			replace("net.minecraft.client.sound.WeightedSoundSet", "net.minecraft.client.sounds.WeighedSoundEvents")
+			replace("net.minecraft.client.sound.SoundInstance", "net.minecraft.client.resources.sounds.SoundInstance")
+			replace("net.minecraft.client.texture.NativeImageBackedTexture", "net.minecraft.client.renderer.texture.DynamicTexture")
+			replace("net.minecraft.client.texture.NativeImage", "com.mojang.blaze3d.platform.NativeImage")
+			replace("net.minecraft.client.util.InputUtil", "com.mojang.blaze3d.platform.InputConstants")
+			replace("net.minecraft.client.util.math.MatrixStack", "org.joml.Matrix3x2fStack")
+			replace("net.minecraft.client.world.ClientWorld", "net.minecraft.client.multiplayer.ClientLevel")
+			replace("net.minecraft.entity.effect.StatusEffectInstance", "net.minecraft.world.effect.MobEffectInstance")
+			replace("net.minecraft.entity.effect.StatusEffects", "net.minecraft.world.effect.MobEffects")
+			replace("net.minecraft.entity.effect.StatusEffect", "net.minecraft.world.effect.MobEffect")
+			replace("net.minecraft.entity.player.PlayerEntity", "net.minecraft.world.entity.player.Player")
+			replace("net.minecraft.entity.EntityType", "net.minecraft.world.entity.EntityType")
+			replace("net.minecraft.entity.EquipmentSlot", "net.minecraft.world.entity.EquipmentSlot")
+			replace("net.minecraft.entity.LivingEntity", "net.minecraft.world.entity.LivingEntity")
+			replace("net.minecraft.entity.Entity", "net.minecraft.world.entity.Entity")
+			replace("net.minecraft.item.Items", "net.minecraft.world.item.Items")
+			replace("net.minecraft.item.ItemStack", "net.minecraft.world.item.ItemStack")
+			replace("net.minecraft.item.Item", "net.minecraft.world.item.Item")
+			replace("net.minecraft.network.ClientConnection", "net.minecraft.network.Connection")
+			replace("net.minecraft.network.packet.Packet", "net.minecraft.network.protocol.Packet")
+			replace("net.minecraft.particle.ParticlesMode", "net.minecraft.server.level.ParticleStatus")
+			replace("net.minecraft.registry.entry.RegistryEntry", "net.minecraft.core.Holder")
+			replace("net.minecraft.registry.Registries", "net.minecraft.core.registries.Registries")
+			replace("net.minecraft.scoreboard.number.StyledNumberFormat", "net.minecraft.network.chat.numbers.StyledFormat")
+			replace("net.minecraft.scoreboard.number.NumberFormat", "net.minecraft.network.chat.numbers.NumberFormat")
+			replace("net.minecraft.scoreboard.ScoreboardDisplaySlot", "net.minecraft.world.scores.DisplaySlot")
+			replace("net.minecraft.scoreboard.ScoreboardEntry", "net.minecraft.world.scores.PlayerScoreEntry")
+			replace("net.minecraft.scoreboard.ScoreboardObjective", "net.minecraft.world.scores.Objective")
+			replace("net.minecraft.scoreboard.Scoreboard", "net.minecraft.world.scores.Scoreboard")
+			replace("net.minecraft.scoreboard.AbstractTeam", "net.minecraft.world.scores.Team")
+			replace("net.minecraft.scoreboard.Team", "net.minecraft.world.scores.PlayerTeam")
+			replace("net.minecraft.server.integrated.IntegratedServer", "net.minecraft.client.server.IntegratedServer")
+			replace("net.minecraft.sound.SoundCategory", "net.minecraft.sounds.SoundSource")
+			replace("net.minecraft.sound.SoundEvents", "net.minecraft.sounds.SoundEvents")
+			replace("net.minecraft.text.MutableText", "net.minecraft.network.chat.MutableComponent")
+			replace("net.minecraft.text.Style", "net.minecraft.network.chat.Style")
+			replace("net.minecraft.text.Text", "net.minecraft.network.chat.Component")
+			replace("net.minecraft.util.hit.BlockHitResult", "net.minecraft.world.phys.BlockHitResult")
+			replace("net.minecraft.util.hit.EntityHitResult", "net.minecraft.world.phys.EntityHitResult")
+			replace("net.minecraft.util.hit.HitResult", "net.minecraft.world.phys.HitResult")
+			replace("net.minecraft.util.math.BlockPos", "net.minecraft.core.BlockPos")
+			replace("net.minecraft.util.math.Direction", "net.minecraft.core.Direction")
+			replace("net.minecraft.util.math.ColorHelper", "net.minecraft.util.ARGB")
+			replace("net.minecraft.util.math.Vec3d", "net.minecraft.world.phys.Vec3")
+			replace("net.minecraft.util.math.Box", "net.minecraft.world.phys.AABB")
+			replace("net.minecraft.util.Identifier", "net.minecraft.resources.Identifier")
+			// No Colors.WHITE-shaped constant in 26.1's util.ARGB (only
+			// white(float)/white(int) methods, which need an alpha arg this
+			// codebase's 3 call sites don't pass) - the plain literal is a
+			// simpler, safe substitute than trying to match a method call
+			// shape via text replacement.
+			replace("Colors.WHITE", "0xFFFFFFFF")
+			// Screen's own render() override point doesn't exist in 26.1 -
+			// same retained-render-state model as widgets
+			// (renderWidget -> extractWidgetRenderState), confirmed via
+			// Fabric API's own HudElement interface adopting the same
+			// convention (render -> extractRenderState(GuiGraphicsExtractor,
+			// DeltaTracker)). Scoped to the two real shapes in this codebase
+			// (Screen overrides use "mouseX, mouseY, delta"; HudModule's own
+			// unrelated render() interface uses "x, y, tickDelta" and must
+			// NOT be touched) rather than a blind "render(" rule.
+			replace("public void render(DrawContext context, int mouseX, int mouseY, float delta)",
+					"public void extractRenderState(GuiGraphicsExtractor context, int mouseX, int mouseY, float delta)")
+			replace("super.render(context, mouseX, mouseY, delta)", "super.extractRenderState(context, mouseX, mouseY, delta)")
+			replace("vanilla.render(context, tickCounter)", "vanilla.extractRenderState(context, tickCounter)")
+			replace("Identifier.of(", "Identifier.fromNamespaceAndPath(")
+			replace("VanillaHudElements.STATUS_EFFECTS", "VanillaHudElements.MOB_EFFECTS")
+			replace("tickCounter.getTickProgress(", "tickCounter.getGameTimeDeltaPartialTick(")
+			// client.options.hudHidden's real target diverges again in 26.2
+			// (Options.hideGui is removed there entirely, HUD-hidden state
+			// moves to the new Hud object) - handled with a manual //? if
+			// block in HudManager.java instead of here (see the long
+			// comment near the end of this file explaining why).
+			replace(".getWindow().getScaledWidth()", ".getWindow().getGuiScaledWidth()")
+			replace(".getWindow().getScaledHeight()", ".getWindow().getGuiScaledHeight()")
+			// Screen widget registration and EditBox's text accessors were
+			// both renamed wholesale in 26.1 (verified via javap against
+			// the real EditBox class) - every call site in this codebase is
+			// on an EditBox-typed variable, no collision risk found.
+			replace("addDrawableChild(", "addRenderableWidget(")
+			replace("addSelectableChild(", "addWidget(")
+			replace(".getText(", ".getValue(")
+			replace(".setText(", ".setValue(")
+			replace("setChangedListener(", "setResponder(")
+			replace("setPlaceholder(", "setHint(")
+			replace("setDrawsBackground(", "setBordered(")
+			// Options' OptionInstance getters dropped the "get" prefix in
+			// 26.1 (and several were renamed outright) - verified via
+			// javap against the real 26.1 Options class one by one, not
+			// guessed. Each is specific/compound enough not to collide
+			// with anything else in this codebase.
+			replace("getPreset()", "graphicsPreset()")
+			replace("getParticles()", "particles()")
+			replace("getEntityShadows()", "entityShadows()")
+			replace("getViewDistance()", "renderDistance()")
+			replace("getEnableVsync()", "enableVsync()")
+			replace("getCloudRenderMode()", "cloudStatus()")
+			replace("getBiomeBlendRadius()", "biomeBlendRadius()")
+			replace("getInactivityFpsLimit()", "inactivityFpsLimit()")
+			replace("getFov()", "fov()")
+			replace("getFovEffectScale()", "fovEffectScale()")
+			replace("getSimulationDistance()", "simulationDistance()")
+			replace("getSneakToggled()", "toggleCrouch()")
+			replace("getSprintToggled()", "toggleSprint()")
+			replace("getMaxFps()", "framerateLimit()")
+			replace("getMipmapLevels()", "mipmapLevels()")
+			replace("getGamma()", "gamma()")
+			replace("getDamageTiltStrength()", "damageTiltStrength()")
+			replace("getDistortionEffectScale()", "screenEffectScale()")
+			replace("getEntityDistanceScaling()", "entityDistanceScaling()")
+			replace("getPerspective()", "getCameraType()")
+			// OptionInstance#getValue()/#setValue(...) -> #get()/#set(...)
+			// (verified via javap) - far too generic to blanket-replace
+			// (would corrupt Map.Entry#getValue(), RegistryKey#getValue(),
+			// etc, all real and used elsewhere in this codebase), so each
+			// is scoped to the exact real OptionInstance-returning call
+			// chain it follows, plus the two local-variable-typed usages
+			// (ToggleSneakModule/ToggleSprintModule's "option", FullBright
+			// Module's "gamma") that hold an OptionInstance directly.
+			// IMPORTANT: each source pattern below must match the ORIGINAL
+			// Yarn-authored text this file is written in (replacements run
+			// as a single simultaneous pass over the original source, not
+			// a cascade over other rules' output) - so these key off the
+			// pre-rename "getXxx()" accessor names, not the post-rename
+			// Mojmap ones, even though the earlier bare "getXxx()"->
+			// "realName()" rules above target the same original text. Being
+			// longer, these compound rules win at the same start position.
+			replace("getPreset().getValue()", "graphicsPreset().get()")
+			replace("getPreset().setValue(", "graphicsPreset().set(")
+			replace("getParticles().getValue()", "particles().get()")
+			replace("getParticles().setValue(", "particles().set(")
+			replace("getEntityShadows().getValue()", "entityShadows().get()")
+			replace("getEntityShadows().setValue(", "entityShadows().set(")
+			replace("getViewDistance().getValue()", "renderDistance().get()")
+			replace("getViewDistance().setValue(", "renderDistance().set(")
+			replace("getEnableVsync().getValue()", "enableVsync().get()")
+			replace("getEnableVsync().setValue(", "enableVsync().set(")
+			replace("getCloudRenderMode().getValue()", "cloudStatus().get()")
+			replace("getCloudRenderMode().setValue(", "cloudStatus().set(")
+			replace("getBiomeBlendRadius().getValue()", "biomeBlendRadius().get()")
+			replace("getBiomeBlendRadius().setValue(", "biomeBlendRadius().set(")
+			replace("getInactivityFpsLimit().getValue()", "inactivityFpsLimit().get()")
+			replace("getInactivityFpsLimit().setValue(", "inactivityFpsLimit().set(")
+			replace("getFov().getValue()", "fov().get()")
+			replace("getFov().setValue(", "fov().set(")
+			replace("getFovEffectScale().getValue()", "fovEffectScale().get()")
+			replace("getFovEffectScale().setValue(", "fovEffectScale().set(")
+			replace("getSimulationDistance().getValue()", "simulationDistance().get()")
+			replace("getSimulationDistance().setValue(", "simulationDistance().set(")
+			replace("getSneakToggled().getValue()", "toggleCrouch().get()")
+			replace("getSneakToggled().setValue(", "toggleCrouch().set(")
+			replace("getSprintToggled().getValue()", "toggleSprint().get()")
+			replace("getSprintToggled().setValue(", "toggleSprint().set(")
+			replace("getMaxFps().getValue()", "framerateLimit().get()")
+			replace("getMaxFps().setValue(", "framerateLimit().set(")
+			replace("getMipmapLevels().getValue()", "mipmapLevels().get()")
+			replace("getMipmapLevels().setValue(", "mipmapLevels().set(")
+			replace("getGamma().getValue()", "gamma().get()")
+			replace("getGamma().setValue(", "gamma().set(")
+			replace("getDamageTiltStrength().getValue()", "damageTiltStrength().get()")
+			replace("getDamageTiltStrength().setValue(", "damageTiltStrength().set(")
+			replace("getDistortionEffectScale().getValue()", "screenEffectScale().get()")
+			replace("getDistortionEffectScale().setValue(", "screenEffectScale().set(")
+			replace("getEntityDistanceScaling().getValue()", "entityDistanceScaling().get()")
+			replace("getEntityDistanceScaling().setValue(", "entityDistanceScaling().set(")
+			replace("option.getValue()", "option.get()")
+			replace("option.setValue(", "option.set(")
+			replace("gamma.getValue()", "gamma.get()")
+			replace("gamma.setValue(", "gamma.set(")
+			replace(".getYaw(", ".getYRot(")
+			replace(".getPitch(", ".getXRot(")
+			replace("client.world", "client.level")
+			// Movement/action KeyMapping fields on Options were renamed
+			// wholesale (verified via javap) - options.forwardKey etc had
+			// no "get" prefix to begin with, so these are bare field-access
+			// renames, safe as this codebase's only Options field accesses.
+			replace("options.forwardKey", "options.keyUp")
+			replace("options.leftKey", "options.keyLeft")
+			replace("options.backKey", "options.keyDown")
+			replace("options.rightKey", "options.keyRight")
+			replace("options.sneakKey", "options.keyShift")
+			replace("options.jumpKey", "options.keyJump")
+			replace("options.sprintKey", "options.keySprint")
+			// KeyBinding#isPressed() -> KeyMapping#isDown() - every call
+			// site in this codebase is on a real key-mapping variable.
+			replace(".isPressed()", ".isDown()")
+			// client.textRenderer/this.textRenderer -> client.font/
+			// this.font already renames the field access itself (see
+			// above), which - being a longer, earlier-starting match -
+			// swallows the immediately-following ".getWidth("/".fontHeight"
+			// before the scoped textRenderer./renderer. rules ever get a
+			// chance to fire on this specific receiver spelling. These
+			// compound rules key off the full original text directly.
+			replace("client.textRenderer.getWidth(", "client.font.width(")
+			replace("client.textRenderer.fontHeight", "client.font.lineHeight")
+			replace("this.textRenderer.getWidth(", "this.font.width(")
+			replace("this.textRenderer.fontHeight", "this.font.lineHeight")
+			// Screen#client (Yarn field) -> Screen#minecraft (Mojmap field) -
+			// scoped to "this.client" (verified this codebase always
+			// qualifies it explicitly, never bare "client" for the Screen
+			// field, which would be ambiguous with the many unrelated
+			// local variables also named "client" throughout the modules).
+			replace("this.client", "this.minecraft")
+			replace("this.clearChildren()", "this.clearWidgets()")
+			replace("this.remove(", "this.removeWidget(")
+			replace("Util.getOperatingSystem()", "Util.getPlatform()")
+			// SoundEventListener/SoundInstance/SoundManager - verified via
+			// javap.
+			replace("onSoundPlayed(", "onPlaySound(")
+			replace("sound.getId()", "sound.getIdentifier()")
+			replace("sound.getCategory()", "sound.getSource()")
+			replace("getSoundManager().registerListener(", "getSoundManager().addListener(")
+			// Scoreboard - verified via javap.
+			replace("getObjectiveForSlot(", "getDisplayObjective(")
+			replace("getScoreboardEntries(", "listPlayerScores(")
+			// Options#getTextBackgroundColor got mangled to
+			// "getComponentBackgroundColor" by the generic Text->Component
+			// rule (it's not a real vanilla method under either of those
+			// names) - the real accessor is getBackgroundColor(float).
+			// GuiGraphicsExtractor#text(...) covers the no-shadow-argument
+			// call shape too (drawText's original callers here always pass
+			// the trailing boolean explicitly) - same target as
+			// drawTextWithShadow above, just not forcing shadow=true.
+			// Scoped (not bare "drawText(" -> "text(") because Stonecutter
+			// forbids two different source patterns resolving to the exact
+			// same target string ("drawTextWithShadow(" -> "text(" already
+			// exists above) - this codebase's only drawText(...) call sites
+			// (ScoreboardHudModule) all share this exact prefix, so this
+			// stays unambiguous while still hitting the real target method.
+			replace("context.drawText(renderer, ", "context.text(renderer, ")
+			// Minecraft#screen (Yarn: currentScreen) needs a different
+			// target per version (plain field in 26.1, Gui#screen() in
+			// 26.2) - handled with manual //? if blocks in each of the six
+			// call-site files instead of here (see the long comment near
+			// the end of this file explaining why).
+			// LivingEntity#getEquippedStack -> #getItemBySlot, ItemStack's
+			// damage/name accessors - verified via javap.
+			replace("getEquippedStack(", "getItemBySlot(")
+			replace(".isDamageable()", ".isDamageableItem()")
+			replace(".getDamage()", ".getDamageValue()")
+			replace("stack.getName()", "stack.getHoverName()")
+			// ARGB#colorFromFloat replaces ColorHelper#fromFloats (name AND
+			// arg order/shape unchanged, just renamed).
+			replace("ColorHelper.fromFloats(", "ARGB.colorFromFloat(")
+			// WorldBorder's compass-direction bound accessors became plain
+			// min/max X/Z (verified via javap).
+			replace("getBoundWest()", "getMinX()")
+			replace("getBoundEast()", "getMaxX()")
+			replace("getBoundNorth()", "getMinZ()")
+			replace("getBoundSouth()", "getMaxZ()")
+			replace("getBottomY()", "getMinY()")
+			replace("getTopYInclusive()", "getMaxY()")
+			// Screen#shouldPause -> #isPauseScreen, Screen#close ->
+			// #onClose (both real overridable Screen hooks - "close(" is
+			// scoped to the exact "public void close()" declaration shape,
+			// which only this codebase's 2 genuine Screen overrides use).
+			replace("public boolean shouldPause()", "public boolean isPauseScreen()")
+			replace("public void close() {", "public void onClose() {")
+			// Screen no longer has a separate public close()-trigger method
+			// distinct from the onClose() override hook - callers invoke
+			// onClose() directly now.
+			replace("this.close()", "this.onClose()")
+			// AbstractWidget's real render entrypoint for external callers
+			// (VeloScrollRegion manually renders a list of widgets) is the
+			// same extractRenderState hook subclasses override.
+			replace("row.render(context, mouseX, mouseY, delta)", "row.extractRenderState(context, mouseX, mouseY, delta)")
+			// VeloBranding references Minecraft inline/fully-qualified
+			// rather than via import.
+			replace("net.minecraft.client.MinecraftClient.getInstance().textRenderer", "net.minecraft.client.Minecraft.getInstance().font")
+			// GuiGraphicsExtractor#item(ItemStack, x, y) is the equivalent
+			// of drawItemWithoutEntity (verified in the method list pulled
+			// earlier from the real class).
+			replace("drawItemWithoutEntity(", "item(")
+			// getTextBackgroundColor (real original text, not the
+			// previously-guessed "getComponentBackgroundColor") ->
+			// getBackgroundColor - same lesson as the OptionInstance chain
+			// fixes above about matching literal original source.
+			replace("getTextBackgroundColor(", "getBackgroundColor(")
+			// F3 debug-overlay entry visibility system was restructured,
+			// not just renamed (verified via javap): debugHudEntryList
+			// field -> debugEntries, DebugHudEntries type ->
+			// DebugScreenEntryList, setEntryVisibility(id, Visibility) ->
+			// setStatus(id, DebugScreenEntryStatus) - the ALWAYS_ON/NEVER
+			// constant names carried over unchanged.
+			replace("net.minecraft.client.gui.hud.debug.DebugHudEntries", "net.minecraft.client.gui.components.debug.DebugScreenEntries")
+			replace("net.minecraft.client.gui.hud.debug.DebugHudEntryVisibility", "net.minecraft.client.gui.components.debug.DebugScreenEntryStatus")
+			replace("DebugHudEntries", "DebugScreenEntries")
+			replace("DebugHudEntryVisibility", "DebugScreenEntryStatus")
+			replace("debugHudEntryList.setEntryVisibility(", "debugEntries.setStatus(")
+			// Scoreboard/Team - verified via javap.
+			replace(".hidden()", ".isHidden()")
+			replace("getScoreHolderTeam(", "getPlayersTeam(")
+			replace("Team.decorateName(", "PlayerTeam.formatNameForTeam(")
+			replace("entry.formatted(", "entry.formatValue(")
+			// KeyMapping#wasPressed -> #consumeClick (verified via javap -
+			// same "did this get clicked since I last checked" semantics).
+			replace("wasPressed()", "consumeClick()")
+			// BlockPos.ofFloored -> BlockPos.containing, Entity#
+			// squaredDistanceTo -> #distanceToSqr, Entity#getUuid ->
+			// #getUUID (case change), Minecraft's network/server/crosshair
+			// accessors - all verified via javap.
+			replace("BlockPos.ofFloored(", "BlockPos.containing(")
+			replace(".squaredDistanceTo(", ".distanceToSqr(")
+			replace(".getUuid()", ".getUUID()")
+			replace("client.getNetworkHandler()", "client.getConnection()")
+			replace("client.getServer()", "client.getSingleplayerServer()")
+			replace("client.crosshairTarget", "client.hitResult")
+			replace("connection.getAveragePacketsSent()", "connection.getAverageSentPackets()")
+			replace("connection.getAveragePacketsReceived()", "connection.getAverageReceivedPackets()")
+			// IntegratedServer#getAverageTickTime() (ms, double) ->
+			// #getAverageTickTimeNanos() (ns, long) - needs the unit
+			// conversion inlined since this is a real shape change, not
+			// just a rename.
+			replace("integrated.getAverageTickTime()", "(integrated.getAverageTickTimeNanos() / 1_000_000.0)")
+			// Registries.BLOCK/.ENTITY_TYPE became ResourceKey<Registry<T>>
+			// references (no longer directly queryable registries) -
+			// BuiltInRegistries holds the real usable DefaultedRegistry
+			// instances now (verified via javap).
+			replace("Registries.BLOCK.getId(", "BuiltInRegistries.BLOCK.getId(")
+			replace("Registries.ENTITY_TYPE.getId(", "BuiltInRegistries.ENTITY_TYPE.getId(")
+			replace("import net.minecraft.registry.Registries;", "import net.minecraft.core.registries.BuiltInRegistries;\nimport net.minecraft.core.registries.Registries;")
+			// Level#getRegistryKey -> #dimension, #getRegistryManager ->
+			// #registryAccess, ResourceKey#getValue -> #identifier
+			// (verified via javap) - scoped as one chain since the
+			// Identifier-extraction method name itself also changed.
+			replace("getRegistryKey().getValue()", "dimension().identifier()")
+			replace("getRegistryManager()", "registryAccess()")
+			// LocalPlayer#sendMessage(Component, boolean) -> #
+			// sendSystemMessage(Component) - the actionbar/chat distinction
+			// isn't exposed on this call anymore; this codebase's one call
+			// site always passed true (actionbar-style transient message).
+			replace("player.sendMessage(net.minecraft.text.Text.literal(\"Copied: \" + text), true)",
+					"player.sendSystemMessage(net.minecraft.network.chat.Component.literal(\"Copied: \" + text))")
+			// Same LocalPlayer#sendMessage(Component, boolean) -> #sendSystemMessage(Component)
+			// divergence, for the shared singleplayer-only warning constant - matches the call
+			// shape rather than a literal message string since any module can reuse the constant.
+			replace("sendMessage(VeloKeybinds.NO_SINGLEPLAYER_MSG, true)", "sendSystemMessage(VeloKeybinds.NO_SINGLEPLAYER_MSG)")
+			// KeyBindingHelper#registerKeyBinding -> KeyMappingHelper#
+			// registerKeyMapping (verified via the real Fabric API repo),
+			// Minecraft#keyboard field -> #keyboardHandler.
+			replace("registerKeyBinding(", "registerKeyMapping(")
+			replace("client.keyboard.", "client.keyboardHandler.")
+			// KeyMapping-related renames, verified via javap.
+			replace("getBoundKeyLocalizedText()", "getTranslatedKeyMessage()")
+			replace("options.allKeys", "options.keyMappings")
+			// Used for physical-key-conflict grouping - saveString()
+			// (a stable string encoding of the current binding) serves the
+			// same "group by what's physically bound" purpose the old
+			// translation-key string did.
+			replace("getBoundKeyTranslationKey()", "saveString()")
+			replace("binding.getId()", "binding.getName()")
+			replace("networkHandler.sendChatCommand(", "networkHandler.sendCommand(")
+			replace(".getWindow().getHandle()", ".getWindow().handle()")
+			// This codebase's "Minecraft.getInstance().textRenderer" call
+			// sites actually read "MinecraftClient.getInstance()..." in the
+			// real original source (the MinecraftClient->Minecraft bare
+			// rule elsewhere doesn't include the trailing field/method
+			// chain), same lesson as the client./this. receiver scoping
+			// above.
+			replace("MinecraftClient.getInstance().textRenderer.getWidth(", "Minecraft.getInstance().font.width(")
+			replace("MinecraftClient.getInstance().textRenderer.fontHeight", "Minecraft.getInstance().font.lineHeight")
+			// Bare (no .getWidth(/.fontHeight suffix) form of the same
+			// chain - real original text confirmed via direct source grep
+			// this time, not the compiler's (sometimes already-partially-
+			// transformed-looking) error text.
+			replace("MinecraftClient.getInstance().textRenderer", "Minecraft.getInstance().font")
+			replace("MinecraftClient.getInstance().keyboard", "Minecraft.getInstance().keyboardHandler")
+			replace("getRenderTickCounter().getDynamicDeltaTicks()", "getDeltaTracker().getGameTimeDeltaTicks()")
+			// Util$OS#open(File) -> #openFile(File) (verified via javap -
+			// several overloads now exist for URI/File/Path/String).
+			// Scoped to the real Util.getPlatform() chain specifically -
+			// this file ALSO calls the unrelated, real JDK method
+			// java.awt.Desktop#open(File), which must not be touched.
+			replace("Util.getOperatingSystem().open(dir)", "Util.getPlatform().openFile(dir)")
+			// InputConstants.Type#createFromCode -> #getOrCreate (verified
+			// via javap).
+			replace(".createFromCode(", ".getOrCreate(")
+			// Holder<MobEffect>#matches(Holder) -> #is(Holder) (verified
+			// via javap) - scoped to this codebase's one usage.
+			replace("effect.matches(", "effect.is(")
+			// KeyBinding.Category -> KeyMapping.Category, KeyBinding#
+			// updateKeysByCode -> KeyMapping#resetMapping - real original
+			// text still says "KeyBinding" here (the bare KeyBinding->
+			// KeyMapping rule elsewhere doesn't include these specific
+			// trailing members).
+			replace("KeyBinding.Category", "KeyMapping.Category")
+			replace("KeyBinding.Category.create(", "KeyMapping.Category.register(")
+			replace("KeyBinding.updateKeysByCode()", "KeyMapping.resetMapping()")
+			// Real original text confirmed via direct source grep for each
+			// of these (compiler error text was sometimes already-
+			// transformed and misleading, as with several rules above).
+			replace("StyledNumberFormat.RED", "StyledFormat.SIDEBAR_DEFAULT")
+			replace("entry.name()", "entry.ownerName()")
+			replace("options.attackKey", "options.keyAttack")
+			replace("options.useKey", "options.keyUse")
+			replace("world.getEntities()", "world.entitiesForRendering()")
+			replace("client.particleManager", "client.particleEngine")
+			replace("client.reloadResources()", "client.reloadResourcePacks()")
+			replace("player.getMainHandStack()", "player.getMainHandItem()")
+			replace("client.worldRenderer", "client.levelRenderer")
+			// ScreenEvents.afterRender(screen) doesn't exist anymore - the
+			// same event (confirmed via its real internal implementation,
+			// fabric_getAfterRenderEvent()) is now exposed as afterExtract,
+			// with an identical 5-arg callback shape.
+			replace("ScreenEvents.afterRender(", "ScreenEvents.afterExtract(")
+			// LevelRenderer#scheduleTerrainUpdate -> #needsUpdate,
+			// #reload() (0-arg) -> #allChanged() (0-arg) in 26.1 specifically
+			// - verified via javap. 26.2 drops both methods from
+			// LevelRenderer entirely (real equivalent there is
+			// levelExtractor.allChanged()) - this pair is handled with a
+			// manual //? if block in PerformanceBoostModule.java instead of
+			// here (see the long comment near the end of this file
+			// explaining why).
+			// Full chain, not just the suffix: "client.worldRenderer" (a
+			// separate, shorter, earlier-starting rule elsewhere) would
+			// otherwise win the position race and leave the trailing
+			// method call unrenamed, same lesson as the font/textRenderer
+			// fixes above.
+			// Minecraft#targetedEntity -> #crosshairPickEntity,
+			// GuiGraphicsExtractor's screen-size accessors dropped "get"/
+			// "Window" (verified via javap).
+			replace("client.targetedEntity", "client.crosshairPickEntity")
+			replace("context.getScaledWindowWidth()", "context.guiWidth()")
+			replace("context.getScaledWindowHeight()", "context.guiHeight()")
+			// InputConstants.Key#getLocalizedText -> #getDisplayName,
+			// KeyMapping#setBoundKey -> #setKey (verified via javap).
+			replace(".getLocalizedText()", ".getDisplayName()")
+			replace("binding.setBoundKey(", "binding.setKey(")
+			// Objective#getNumberFormatOr(StyledFormat) ->
+			// #numberFormatOrDefault(NumberFormat) - same arg, real param
+			// type just widened to the NumberFormat interface.
+			replace("getNumberFormatOr(", "numberFormatOrDefault(")
+			// ParticleEngine#getDebugString -> #countParticles (closest
+			// real equivalent debug-text accessor).
+			replace("client.particleManager.getDebugString()", "client.particleEngine.countParticles()")
+			// FullBrightMixin's @Inject targets (LivingEntity method names,
+			// verified via javap AND by actually launching the 26.1 dev
+			// client, which is what caught this - Mixin's string-based
+			// method targets aren't checked by javac at all).
+			replace("method = \"hasStatusEffect\"", "method = \"hasEffect\"")
+			replace("method = \"getStatusEffect\"", "method = \"getEffect\"")
+			// ClientConnectionMixin's @Inject method-descriptor strings use
+			// JVM internal descriptor syntax (slash-separated, "L...;"),
+			// which the dotted-path Packet rename above doesn't touch at
+			// all - discovered by actually launching the 26.1 dev client
+			// (Mixin only validates these strings at runtime, not javac).
+			// Connection now also has an inherited two-overload
+			// channelRead0 (an Object-typed one alongside the Packet-typed
+			// one), so the bare "channelRead0" target is made explicit too
+			// to avoid new ambiguity.
+			replace("method = \"send(Lnet/minecraft/network/packet/Packet;)V\"",
+					"method = \"send(Lnet/minecraft/network/protocol/Packet;)V\"")
+			replace("method = \"channelRead0\"",
+					"method = \"channelRead0(Lio/netty/channel/ChannelHandlerContext;Lnet/minecraft/network/protocol/Packet;)V\"")
+			// MouseHandler#onMouseScroll -> #onScroll (verified by reading
+			// the real decompiled 26.1 source directly - same (long, double,
+			// double) param shape, just renamed).
+			replace("method = \"onMouseScroll\"", "method = \"onScroll\"")
+			// PlayerListHudMixin's @Redirect: its enclosing method "render"
+			// is PlayerTabOverlay's own extractRenderState now, and the
+			// INVOKE target it redirects (DrawContext#drawTextWithShadow)
+			// moved wholesale to GuiGraphicsExtractor#text with Font/
+			// Component's real packages - verified by actually launching
+			// the 26.1 dev client, which is what caught every one of these
+			// mixin descriptor strings (javac never validates them).
+			replace("method = \"render\", at = @At(value = \"INVOKE\",", "method = \"extractRenderState\", at = @At(value = \"INVOKE\",")
+			replace("target = \"Lnet/minecraft/client/gui/DrawContext;drawTextWithShadow(Lnet/minecraft/client/font/TextRenderer;Lnet/minecraft/text/Text;III)V\"",
+					"target = \"Lnet/minecraft/client/gui/GuiGraphicsExtractor;text(Lnet/minecraft/client/gui/Font;Lnet/minecraft/network/chat/Component;III)V\"")
+			// Import line specifically (distinguished from ZoomModule's
+			// inline, import-less usage by the "import "/";" bookends,
+			// avoiding the same-source-different-target ambiguity that
+			// would occur with a bare fully-qualified rule).
+			replace("import net.fabricmc.fabric.api.client.rendering.v1.world.WorldRenderContext;",
+					"import net.fabricmc.fabric.api.client.rendering.v1.level.LevelRenderContext;")
+			// Minecraft FPS/GPU stats, LivingEntity's active-effects
+			// collection, MobEffectInstance/MobEffect/EntityType display
+			// accessors, Gui's effect-icon sprite lookup, Level chunk/
+			// height/nbt accessors - all verified via javap.
+			replace("client.getGpuUtilizationPercentage()", "client.getGpuUtilization()")
+			replace("client.getCurrentFps()", "client.getFps()")
+			replace(".getStatusEffects()", ".getActiveEffects()")
+			// Gui#getMobEffectSprite's real target diverges per version too
+			// (Gui in 26.1, a new Hud class in 26.2) - handled with a manual
+			// //? if block in PotionTimersModule.java instead of here (see
+			// the long comment near the end of this file explaining why).
+			replace("effect.getEffectType().value().getName()", "effect.getEffect().value().getDisplayName()")
+			replace("entry.getKey().getName()", "entry.getKey().getDescription()")
+			replace("world.isChunkLoaded(", "world.hasChunk(")
+			replace("Heightmap.Type", "Heightmap.Types")
+			replace("world.getTopY(", "world.getHeight(")
+			replace("world.getLightLevel(", "world.getBrightness(")
+			// MapColor (MinimapModule's column-color sampling) - verified via
+			// javap. Package moved, CLEAR->NONE, and the render-color method
+			// itself was renamed (its real Mojmap name, "calculateARGBColor",
+			// also confirms the return value really is a packed ARGB int).
+			// Scoped to the "mapColor." receiver actually used in this
+			// codebase rather than a bare ".getRenderColor(" - specific
+			// enough to be safe on its own, but no reason not to be extra
+			// precise here too.
+			replace("net.minecraft.block.MapColor", "net.minecraft.world.level.material.MapColor")
+			replace("MapColor.CLEAR", "MapColor.NONE")
+			replace("mapColor.getRenderColor(", "mapColor.calculateARGBColor(")
+			// BlockPos.Mutable -> BlockPos.MutableBlockPos - verified via
+			// javap (both 26.1 and 26.2 keep the same nested-class name).
+			replace("BlockPos.Mutable", "BlockPos.MutableBlockPos")
+			// Entity#getBlockPos -> #blockPosition, scoped to the receiver
+			// this codebase actually uses - a bare ".getBlockPos(" rule
+			// would be wrong, since BlockHitResult#getBlockPos (used
+			// elsewhere, e.g. LookingAtInspectorModule) keeps that exact
+			// name unchanged in Mojmap (verified via javap on both types).
+			replace("client.player.getBlockPos()", "client.player.blockPosition()")
+			// Font#wrapLines -> #split (the Wavey Capes note in
+			// CapeEditScreen, and VeloLabel's general-purpose wrapped-text
+			// row widget) - verified via javap. Two receiver forms actually
+			// used in this codebase, both scoped rather than a bare
+			// ".wrapLines(" rule.
+			replace("this.textRenderer.wrapLines(", "this.font.split(")
+			replace("textRenderer.wrapLines(", "textRenderer.split(")
+			replace("blockEntity.createNbt(", "blockEntity.saveWithFullMetadata(")
+			replace("BuiltInRegistries.BLOCK.getId(", "BuiltInRegistries.BLOCK.getKey(")
+			replace("BuiltInRegistries.ENTITY_TYPE.getId(", "BuiltInRegistries.ENTITY_TYPE.getKey(")
+			// Motion Blur's post-processing shader pipeline (verified against
+			// real vanilla GameRenderer.java, which loads this exact same
+			// blur effect for the pause menu background).
+			replace("net.minecraft.client.gl.PostEffectProcessor", "net.minecraft.client.renderer.PostChain")
+			replace("net.minecraft.client.render.DefaultFramebufferSet", "net.minecraft.client.renderer.LevelTargetBundle")
+			replace("net.minecraft.client.util.memory.ObjectAllocator", "com.mojang.blaze3d.resource.GraphicsResourceAllocator")
+			replace("PostEffectProcessor", "PostChain")
+			replace("client.getShaderLoader().loadPostEffect(id, DefaultFramebufferSet.MAIN_ONLY)",
+					"client.getShaderManager().getPostChain(id, LevelTargetBundle.MAIN_TARGETS)")
+			// processor.render(...)'s target-fetching arg needs a different
+			// form per version (Minecraft loses #getMainRenderTarget() in
+			// 26.2, but GameRenderer keeps its own #mainRenderTarget() -
+			// verified via javap) - handled with a manual //? if block in
+			// MotionBlurModule.java instead (see the long comment near the
+			// end of this file explaining why).
+			// appendClickableNarrations(NarrationMessageBuilder) -> the
+			// abstract hook AbstractWidget actually declares is
+			// updateWidgetNarration(NarrationElementOutput); its own
+			// .put(...) method is called .add(...) instead. Every one of
+			// this codebase's 5 custom widgets uses the identical
+			// signature/call shape, verified via javap against the real
+			// AbstractWidget/NarrationElementOutput classes.
+			replace("protected void appendClickableNarrations(NarrationMessageBuilder builder)",
+					"protected void updateWidgetNarration(NarrationElementOutput builder)")
+			replace("builder.put(", "builder.add(")
+			// MinecraftClient#textRenderer (field) -> Minecraft#font -
+			// scoped to the two receiver spellings this codebase actually
+			// uses, same reasoning as the .getWidth()/.fontHeight scoping
+			// above (NativeImage keeps unrelated method names that would
+			// collide with a blind rule).
+			replace("client.textRenderer", "client.font")
+			replace("this.textRenderer", "this.font")
+			// PositionedSoundInstance.ui(sound, pitch) -> the equivalent
+			// simple/one-shot UI sound factory is SimpleSoundInstance.forUI
+			// with the same 2-arg shape (verified via javap) - not the
+			// generic PositionedSoundInstance->AbstractTickableSoundInstance
+			// bare-type rename above, which is for a different (looping/
+			// tickable) sound instance class entirely.
+			replace("net.minecraft.client.sound.PositionedSoundInstance", "net.minecraft.client.resources.sounds.SimpleSoundInstance")
+			replace("PositionedSoundInstance.ui(", "SimpleSoundInstance.forUI(")
+			// AbstractWidget's own override hook: renderWidget ->
+			// extractWidgetRenderState (mirrors the Screen-level
+			// render -> extractRenderState rename above).
+			replace("protected void renderWidget(DrawContext context, int mouseX, int mouseY, float delta)",
+					"protected void extractWidgetRenderState(GuiGraphicsExtractor context, int mouseX, int mouseY, float delta)")
+			// Fabric API module restructuring for 26.1/26.2, verified
+			// against the real FabricMC/fabric repo (default branch is
+			// literally named "26.2") rather than guessed.
+			replace("net.fabricmc.fabric.api.client.keybinding.v1.KeyBindingHelper", "net.fabricmc.fabric.api.client.keymapping.v1.KeyMappingHelper")
+			replace("KeyBindingHelper", "KeyMappingHelper")
+			// ZoomModule uses the fully-qualified form (not imported) for
+			// its BEFORE_ENTITIES->START_MAIN handler, whose real callback
+			// takes LevelTerrainRenderContext specifically (verified
+			// against the real Fabric API source) - different from the
+			// three debug-overlay modules below, which import it bare and
+			// use the plain LevelRenderContext (BEFORE_GIZMOS's real param
+			// type). Scoped to ZoomModule's exact method declaration rather
+			// than the bare fully-qualified name, since that name ALSO
+			// appears in the other three files' import lines - a bare
+			// scope would wrongly flip their import to
+			// LevelTerrainRenderContext while their param stayed
+			// LevelRenderContext (via the separate bare-name rule below),
+			// an import/usage mismatch.
+			replace("private void onFrame(net.fabricmc.fabric.api.client.rendering.v1.world.WorldRenderContext context)",
+					"private void onFrame(net.fabricmc.fabric.api.client.rendering.v1.level.LevelTerrainRenderContext context)")
+			replace("net.fabricmc.fabric.api.client.rendering.v1.world.WorldRenderEvents", "net.fabricmc.fabric.api.client.rendering.v1.level.LevelRenderEvents")
+			replace("WorldRenderContext", "LevelRenderContext")
+			// BEFORE_DEBUG_RENDER doesn't exist in the new event set - the
+			// three modules that use it are pure debug/visualization
+			// overlays (world border, light levels, waypoints) drawn via
+			// the Gizmos API, and BEFORE_GIZMOS is the semantically exact
+			// replacement hook for that. ZoomModule's BEFORE_ENTITIES use
+			// never actually touches its context parameter (it's a pure
+			// per-frame FOV-animation timing hook) - START_MAIN (earliest
+			// hook in the new event set) serves the same purpose.
+			replace("WorldRenderEvents.BEFORE_DEBUG_RENDER", "LevelRenderEvents.BEFORE_GIZMOS")
+			replace("WorldRenderEvents.BEFORE_ENTITIES", "LevelRenderEvents.START_MAIN")
+			replace("WorldRenderEvents", "LevelRenderEvents")
+			// The import itself becomes unused once the constant above is
+			// inlined - repointed at a real class instead of deleted so it
+			// stays valid Java (an unused import is a warning, not an
+			// error; deleting the line via text replacement isn't possible
+			// with this tool). Points at Util (not ARGB) specifically to
+			// avoid an ambiguous-replacement error from two different
+			// source strings both targeting "net.minecraft.util.ARGB".
+			replace("net.minecraft.util.Colors", "net.minecraft.util.Util")
+			replace("net.minecraft.world.border.WorldBorder", "net.minecraft.world.level.border.WorldBorder")
+			// GizmoDrawing was split into a static Gizmos facade with
+			// per-shape methods (verified via javap against the real 26.1
+			// AND 26.2 common jars, not guessed - identical signatures on
+			// both, so safe as an unbounded ">=26.1" rule per the
+			// same-diff-both-steps rule explained in the 26.2-only block
+			// below) - box->cuboid, blockLabel->billboardTextOverBlock
+			// (same 5-arg shape: String, BlockPos, int, int, float),
+			// entityLabel->billboardTextOverMob (same 5-arg shape: Entity,
+			// int, String, int, float), line/point unchanged. DrawStyle.stroked ->
+			// GizmoStyle.stroke. ignoreOcclusion() has no direct
+			// equivalent on the new GizmoProperties - setAlwaysOnTop() is
+			// the closest (draws through terrain), though not perfectly
+			// identical semantics; worth a visual check later.
+			replace("net.minecraft.world.debug.gizmo.GizmoDrawing", "net.minecraft.gizmos.Gizmos")
+			replace("GizmoDrawing.box(", "Gizmos.cuboid(")
+			replace("GizmoDrawing.blockLabel(", "Gizmos.billboardTextOverBlock(")
+			replace("GizmoDrawing.entityLabel(", "Gizmos.billboardTextOverMob(")
+			replace("GizmoDrawing.point(", "Gizmos.point(")
+			// "line" itself is the same method name on the new Gizmos facade
+			// too (verified via javap on both the 26.1 and 26.2 common jars),
+			// but the bare class reference still needs the same swap the
+			// other GizmoDrawing.X( calls above get explicitly - there's no
+			// generic bare "GizmoDrawing"->"Gizmos" rule (deliberately, to
+			// avoid also matching inside unrelated identifiers), so each
+			// call shape needs its own line even when the method name itself
+			// doesn't change.
+			replace("GizmoDrawing.line(", "Gizmos.line(")
+			// "arrow" itself is likewise the same method name/shape on the new Gizmos facade
+			// (verified via javap on the 26.1 common jar - Vec3/Vec3/int/float, identical to the
+			// old GizmoDrawing.arrow(Vec3d,Vec3d,int,float)), same reasoning as the "line" call
+			// immediately above needing its own explicit bare-class swap.
+			replace("GizmoDrawing.arrow(", "Gizmos.arrow(")
+			// billboardText covers the free-floating (not block/entity
+			// snapped) text call - needed for TntTimerModule, which can't
+			// use billboardTextOverMob/entityLabel since that snaps to the
+			// entity's containing BLOCK cell (getBlockX()/getBlockZ()) not
+			// its real continuous position, a real confirmed bug for a
+			// falling/moving entity (the label visibly snapped between block
+			// cells instead of tracking smoothly, and wasn't even centered
+			// over a mid-block position). TextGizmo lives in the same
+			// renamed common package as Gizmos itself.
+			replace("GizmoDrawing.text(", "Gizmos.billboardText(")
+			// Shields the bare "TextGizmo" class name from the bare
+			// "Text"->"Component" rule below (not word-boundary-aware, so it
+			// would otherwise mangle this into the nonexistent
+			// "ComponentGizmo" - a real confirmed compile failure), the same
+			// technique as the getBoundingBox() shield above.
+			replace("TextGizmo", "TextGizmo")
+			// Shields for real Mojmap packet class names that contain "Text" - without these the
+			// bare "Text" -> "Component" rule below mangles them (BackgroundQueue's GhostPackets).
+			replace("ClientboundSetActionBarTextPacket", "ClientboundSetActionBarTextPacket")
+			// Mojmap's EditBox (26.x blocks, Velo Rewind's save screen) - the bare Box rule would make it "EditAABB".
+			replace("components.EditBox", "components.EditBox")
+			// GuiRenderState$Node#addText (GuiLayerListMixin's method list) - the
+			// bare Text rule turned it into "addComponent", so the require = 0
+			// redirect silently never applied to text.
+			replace("\"addText\"", "\"addText\"")
+			// EntityRenderState#scoreText (NameTagLinesMixin's 26.x branches).
+			replace("state.scoreText", "state.scoreText")
+			// EntityRenderState#boundingBoxHeight (NameTagLinesMixin) - the bare Box rule would
+			// turn it into "boundingAABBHeight".
+			replace("boundingBoxHeight", "boundingBoxHeight")
+			// SodiumWorldRenderer#isBoxVisible (SodiumVisibility, Velo Turbo particle culling) - Sodium's real name.
+			replace("isBoxVisible(", "isBoxVisible(")
+			// Sodium's real package (TurboSodiumCacheCleanupMixin) - the world -> level rule would rewrite it.
+			replace("sodium.client.world.cloned", "sodium.client.world.cloned")
+			// HudFrameCache (Velo Turbo HUD cache) - real Mojmap GuiRenderState names containing "Text".
+			replace("GuiTextRenderState", "GuiTextRenderState")
+			replace("state.addText((", "state.addText((")
+			replace("real.addText(", "real.addText(")
+			replace("public void addText(net.minecraft.client.renderer.state.gui", "public void addText(net.minecraft.client.renderer.state.gui")
+			replace("public void forEachText(java.util", "public void forEachText(java.util")
+			replace("real.forEachText(", "real.forEachText(")
+			replace("super.addText(", "super.addText(")
+			replace("super.forEachText(", "super.forEachText(")
+			// Display.TextDisplay (HologramAccessor / PvpCompat) - the bare Text rule would make it
+			// "ComponentDisplay".
+			replace("Display.TextDisplay", "Display.TextDisplay")
+			// HologramAccessor's @Invoker("getText") - real Mojmap method name.
+			replace("\"getText\"", "\"getText\"")
+			replace("ClientboundSetSubtitleTextPacket", "ClientboundSetSubtitleTextPacket")
+			replace("ClientboundSetTitleTextPacket", "ClientboundSetTitleTextPacket")
+			// Name Styles' glyph hook (Font$PreparedTextBuilder) and Clips Pro's win-title hooks - real Mojmap names.
+			replace("PreparedTextBuilder", "PreparedTextBuilder")
+			// Anti Coords Leak's Font#prepareText hooks (AntiCoordsFontMixin) - real Mojmap names.
+			replace("prepareText(", "prepareText(")
+			replace("Font\$PreparedText;", "Font\$PreparedText;")
+			replace("\"setTitleText\"", "\"setTitleText\"")
+			replace("\"setSubtitleText\"", "\"setSubtitleText\"")
+			// Real Mojmap method (LivingEntityRenderer) that the bare "RenderLayers" rule would mangle.
+			replace("shouldRenderLayers", "shouldRenderLayers")
+			// World Notes draw their text like signs do: SubmitNodeCollector#submitText + Component#getVisualOrderText (real Mojmap).
+			replace("submitText(", "submitText(")
+			replace("getVisualOrderText", "getVisualOrderText")
+			// Tab list width cache (TabListCacheMixin): Font#width(FormattedText) - real Mojmap type.
+			replace("FormattedText", "FormattedText")
+			// Mojmap consume effect class used by PvpCompat - the bare StatusEffect rule would
+			// turn it into the nonexistent "ApplyMobEffectsConsumeEffect".
+			replace("ApplyStatusEffectsConsumeEffect", "ApplyStatusEffectsConsumeEffect")
+			replace("net.minecraft.world.debug.gizmo.TextGizmo", "net.minecraft.gizmos.TextGizmo")
+			replace(".ignoreOcclusion()", ".setAlwaysOnTop()")
+			replace("DrawStyle.stroked(", "GizmoStyle.stroke(")
+			// Same 1-arg shape on both (verified via javap on the 26.1 AND
+			// 26.2 common jars) - used for thin filled boxes standing in for
+			// line segments (see ChunkBorderOverlayModule), since 1.21.11's
+			// own GizmoDrawing.line(...) turned out to render with a real,
+			// confirmed visual bug there (drifted with the player instead of
+			// staying fixed per-chunk) that the newer Gizmos facade doesn't
+			// have - box() was already proven correct on all three versions
+			// (WorldBorderVisualizerModule), so line-shaped segments switched
+			// to thin boxes instead of chasing the older implementation's bug.
+			replace("DrawStyle.filled(", "GizmoStyle.fill(")
+			replace("net.minecraft.client.render.DrawStyle", "net.minecraft.gizmos.GizmoStyle")
+			replace("DrawStyle", "GizmoStyle")
+			replace("net.minecraft.world.Heightmap", "net.minecraft.world.level.levelgen.Heightmap")
+			replace("net.minecraft.world.LightType", "net.minecraft.world.level.LightLayer")
+
+			// --- Bare simple-name renames (for code that refers to the type
+			// unqualified after import). Each of these is either a distinct
+			// enough word on its own, or - where it could appear inside a
+			// longer unrelated identifier - only ever appears in this
+			// codebase as itself (verified by grep, not assumed), so
+			// there's nothing for it to corrupt.
+			replace("MinecraftClient", "Minecraft")
+			replace("DrawContext", "GuiGraphicsExtractor")
+			replace("ClickableWidget", "AbstractWidget")
+			replace("TextFieldWidget", "EditBox")
+			replace("TextRenderer", "Font")
+			replace("NarrationMessageBuilder", "NarrationElementOutput")
+			replace("NarrationPart", "NarratedElementType")
+			replace("ClientPlayNetworkHandler", "ClientPacketListener")
+			replace("PlayerListEntry", "PlayerInfo")
+			// Bare "PlayerListHud"/"ClientConnection" are unsafe here: this
+			// codebase's own mixin class names are "PlayerListHudMixin" and
+			// "ClientConnectionMixin" (unrelated to the vanilla rename, just
+			// named after their target) - the file itself never gets
+			// renamed, so a bare-word swap corrupting the public class name
+			// to no longer match its filename is a compile error ("class
+			// PlayerTabOverlayMixin is public, should be declared in a file
+			// named PlayerTabOverlayMixin.java"). Scoped to the one real
+			// usage shape (@Mixin target) instead.
+			replace("PlayerListHud.class", "PlayerTabOverlay.class")
+			// Shield this codebase's own "ClientConnectionMixin" class name
+			// (self-mapped, longer match at the same start position wins
+			// over the bare "ClientConnection" rule below) so the bare rule
+			// can safely handle every OTHER real usage (e.g.
+			// TpsTickGraphModule's "ClientConnection connection = ..."
+			// declaration).
+			replace("ClientConnectionMixin", "ClientConnectionMixin")
+			replace("ClientConnection", "Connection")
+			replace("InGameHud", "Gui")
+			replace("GameOptions", "Options")
+			replace("KeyBinding", "KeyMapping")
+			replace("InputUtil", "InputConstants")
+			replace("ClientWorld", "ClientLevel")
+			replace("PlayerEntityRenderState", "PlayerRenderState")
+			replace("PlayerEntity", "Player")
+			replace("NativeImageBackedTexture", "DynamicTexture")
+			replace("SoundCategory", "SoundSource")
+			replace("MutableText", "MutableComponent")
+			replace("Vec3d", "Vec3")
+			replace("ScoreboardObjective", "Objective")
+			replace("ScoreboardEntry", "PlayerScoreEntry")
+			replace("ScoreboardDisplaySlot", "DisplaySlot")
+			replace("AbstractTeam", "Team")
+			replace("GameMenuScreen", "PauseScreen")
+			// Bare "Mouse" is unsafe (collides with our own MouseScrollMixin/
+			// MouseButtonsModule class names - and MouseScrollMixin's own
+			// name has to stay put, since velo-client.client.mixins.json
+			// references it by string and isn't run through this
+			// preprocessor) - scoped to how the type is actually used here
+			// (import + "Mouse.class" mixin target) instead.
+			replace("Mouse.class", "MouseHandler.class")
+			replace("StatusEffectInstance", "MobEffectInstance")
+			replace("StatusEffects", "MobEffects")
+			replace("StatusEffect", "MobEffect")
+			replace("RegistryEntry", "Holder")
+			replace("RenderTickCounter", "DeltaTracker")
+			replace("StyledNumberFormat", "StyledFormat")
+			// Shields Entity#getBoundingBox() - a real, identically-named
+			// method on both mappings (verified via javap on the 26.1 AND
+			// 26.2 common jars) - from the bare "Box"->"AABB" rule below,
+			// which would otherwise also match the "Box" inside this name
+			// (not word-boundary-aware) and mangle it into the
+			// nonexistent "getBoundingAABB()" (a real, confirmed compile
+			// failure, not hypothetical). A longer match registered at the
+			// same start position always wins per this file's own matching
+			// rules, so this "shields" it the same way "TextFieldWidget"
+			// shields the bare "Text" rule elsewhere in this file.
+			replace("getBoundingBox()", "getBoundingBox()")
+			// Same shielding trick as getBoundingBox() above, for the other real,
+			// identically-named-in-both-mappings type this codebase now uses that happens to
+			// contain "Box" as a substring (a bare `instanceof
+			// ShulkerBoxBlock` - the import line itself is already handled by the longer FQN
+			// swap above, but a bare, unqualified reference to the class elsewhere isn't).
+			replace("ShulkerBoxBlock", "ShulkerBoxBlock")
+			replace("Box", "AABB")
+			replace("LightType", "LightLayer")
+			replace("CloudRenderMode", "CloudStatus")
+			replace("GraphicsMode", "GraphicsPreset")
+			replace("ParticlesMode", "ParticleStatus")
+			replace("EntityRendererFactory", "EntityRendererProvider")
+			replace("FeatureRendererContext", "RenderLayerParent")
+			// Bare "FeatureRenderer" would also corrupt this codebase's own
+			// "CapeFeatureRenderer" class name (same class of bug as the
+			// PlayerListHud/ClientConnection mixins above) - scoped to the
+			// two real usage shapes instead (extends clause, generic type
+			// argument).
+			replace("extends FeatureRenderer<", "extends RenderLayer<")
+			replace("FeatureRenderer<", "RenderLayer<")
+			replace("EntityModelLayers", "ModelLayers")
+			replace("RenderLayers", "RenderType")
+			replace("SoundInstanceListener", "SoundEventListener")
+			replace("WeightedSoundSet", "WeighedSoundEvents")
+			replace("MatrixStack", "Matrix3x2fStack")
+
+			// --- Method/member renames. Each source pattern is either its
+			// own unique compound (safe on its own) or explicitly scoped to
+			// the receiver variable name(s) actually used in this codebase,
+			// so it can't also match the *NativeImage* methods of the same
+			// short name (see the getWidth/getHeight note below).
+			replace("drawTextWithShadow(", "text(")
+			replace("drawCenteredTextWithShadow(", "centeredText(")
+			replace("drawGuiTexture(", "blitSprite(")
+			replace("drawTexture(", "blit(")
+			replace(".getColorArgb(", ".getPixel(")
+			replace(".setColorArgb(", ".setPixel(")
+			replace(".styled(", ".withStyle(")
+			replace(".writeTo(", ".writeToFile(")
+			replace("registerTexture(", "register(")
+			replace("destroyTexture(", "release(")
+			// NativeImageBackedTexture#getImage/#setImage -> DynamicTexture#
+			// getPixels/#setPixels (MinimapManager's texture-update path) -
+			// verified via javap. Scoped to the receiver this codebase
+			// actually uses, since "getImage"/"setImage" alone would be too
+			// generic to risk leaving bare.
+			replace("texture.getImage(", "texture.getPixels(")
+			replace("texture.setImage(", "texture.setPixels(")
+			replace(".getMatrices(", ".pose(")
+			// TextRenderer#getWidth/#fontHeight -> Font#width/#lineHeight -
+			// NativeImage keeps getWidth()/getHeight() unchanged in 26.1
+			// (verified via javap), so this can't be a bare ".getWidth("
+			// rule - it's scoped to the exact receiver names this codebase
+			// actually uses for the text renderer/font field.
+			replace("textRenderer.getWidth(", "textRenderer.width(")
+			replace("textRenderer.fontHeight", "textRenderer.lineHeight")
+			replace("renderer.getWidth(", "renderer.width(")
+			replace("renderer.fontHeight", "renderer.lineHeight")
+
+			// --- Shields: real vanilla names that are unchanged in 26.1 but
+			// contain "Text" as a substring (e.g. inside "Texture") and
+			// would otherwise be corrupted by the bare "Text" rule below,
+			// since nothing else "claims" that span of text to protect it.
+			replace("getTextureManager", "getTextureManager")
+			replace("getEffectTexture", "getEffectTexture")
+			replace("OverlayTexture", "OverlayTexture")
+			// ClientAsset.ResourceTexture/.Texture (LocalPlayerSkinCapeMixin's
+			// 26.1+ branch, used to build/hold a substitute cape/elytra
+			// texture asset).
+			replace("ResourceTexture", "ResourceTexture")
+			replace("ClientAsset.Texture", "ClientAsset.Texture")
+			// Blanket shield for every remaining bare "Texture" (this
+			// codebase's own class/method names too, e.g. "RemoteTextureLoader",
+			// not just vanilla ones) - a real, confirmed repeat of this exact
+			// bug (see the top-of-file comment: "Text"->"Component" mangled
+			// "drawTexture" into "drawComponenture" once already) hit again
+			// here with "RemoteTextureLoader" -> "RemoteComponentureLoader".
+			// Registering the identity match on the whole word, rather than
+			// enumerating every individual identifier that happens to contain
+			// it, means any *future* "...Texture..." name added to this
+			// codebase is shielded automatically too - still safe against the
+			// longer specific rules above (registerTexture(/destroyTexture(/
+			// NativeImageBackedTexture/etc. are all longer matches at the
+			// same start position, so they keep winning over this).
+			replace("Texture", "Texture")
+
+			// --- The generic renames. Deliberately last and deliberately
+			// narrow: by this point every real vanilla identifier that
+			// contains "Text"/"Click" as a substring has already been
+			// consumed above by a longer/earlier match, so what's left for
+			// these two bare rules to touch is only genuine standalone
+			// "Text"/"Click" type references (plus this codebase's own
+			// identifiers that happen to contain them, which is harmless -
+			// a consistently-renamed private field/method still compiles).
+			replace("Click click", "MouseButtonEvent click")
+			// KeyInput (Yarn) doesn't exist at all in 26.1 - keyPressed's
+			// single-object param type is called KeyEvent instead, same
+			// package. Used inline/fully-qualified rather than imported in
+			// this codebase, which is why it wasn't caught by scanning
+			// import lines - a reminder there could be other inline
+			// fully-qualified references like it.
+			replace("net.minecraft.client.input.KeyInput", "net.minecraft.client.input.KeyEvent")
+			replace("Text", "Component")
+		}
+
+		// --- IMPORTANT: rules that are correct for 26.1 but need a DIFFERENT
+		// target in 26.2 CANNOT be expressed as a bounded
+		// "current.parsed >= X && current.parsed < Y" condition here, even
+		// though that seems like the obvious approach. Confirmed by a real,
+		// silent-corruption bug: Stonecutter generates each subproject via a
+		// sequential chain of diffs across the configured version order
+		// (1.21.11 -> 26.1 -> 26.2), not independently per version. A rule
+		// that's true at the 26.1 step and false at the 26.2 step produces a
+		// REVERSE diff at that transition, applied wherever its TARGET text
+		// happens to appear in 26.1's generated output - including
+		// completely unrelated code. This corrupted
+		// "net.fabricmc.fabric.api.client.screen.v1.ScreenEvents" (an
+		// unrelated Fabric API import, own package name coincidentally
+		// containing ".screen") into "...client.currentScreen.v1..." when a
+		// bounded ".currentScreen" -> ".screen" rule's target text ".screen"
+		// got reverse-matched going into 26.2. Every rule below that
+		// genuinely diverges between 26.1 and 26.2 is handled with a manual
+		// //? if <26.1 { } else if <26.2 { } else { } block in its own
+		// source file instead (same proven-safe mechanism already used for
+		// CapeFeatureRenderer.java/GameRendererFovMixin.java's structural
+		// splits) - see HudManager.java, PerformanceBoostModule.java,
+		// PotionTimersModule.java, MotionBlurModule.java, and the six
+		// Minecraft#screen (Yarn: currentScreen) read sites.
+
+		// --- 26.2-only deltas from 26.1, each verified via javap against the
+		// real 26.2 client-only/common jars (not guessed - 26.2 changes a
+		// surprising amount on its own beyond the 1.21.11->26.1 jump: Gui
+		// itself split into a screen-management Gui + a rendering Hud class,
+		// Options.hideGui/hudHidden disappeared entirely, EntityType's own
+		// constant fields (PLAYER etc.) moved to a new EntityTypes class,
+		// Items.LIGHTNING_ROD became a WeatheringCopperCollection<Item>
+		// instead of a plain Item, and LevelRenderer#needsUpdate/#allChanged
+		// don't exist anymore - the real call vanilla's own
+		// VideoSettingsScreen makes on an option change is
+		// Minecraft#levelExtractor.allChanged(), confirmed by javap -c on
+		// the real Options/VideoSettingsScreen classes).
+		// Only for versions at or after the sources' own (1.21.11): Stonecutter applies a false condition in REVERSE,
+		// which turned every Mojmap word back into Yarn in older versions (1.21.10's Map.Entry.getValue() -> getText()).
+		if (current.parsed >= "1.21.11") string(current.parsed >= "26.2") {
+			// Minecraft#screen/#setScreen(Screen) moved onto a new Gui field
+			// (Minecraft#gui) as #screen()/#setScreen(Screen) - verified via
+			// javap. IMPORTANT: this is deliberately a SUFFIX-only rule
+			// (".setScreen(", not "this.client.setScreen(" or
+			// "client.setScreen(") so its match never starts at the same
+			// position as the shared, unbounded "this.client"->
+			// "this.minecraft" rule. A same-start compound rule here
+			// (tried first, reverted) statically wins that shielding contest
+			// over the shorter rule REGARDLESS of whether its own condition
+			// is true for the version actually being built - so on 26.1
+			// (where >=26.2 is false) the longer rule "claims" the span but
+			// never fires, and the shorter, correctly-true "this.client"
+			// rule never gets a chance either, leaving literal
+			// "this.client.setScreen(" in 26.1's output (a real, confirmed
+			// bug, not a hypothetical). A suffix rule starting right after
+			// "this.client"/"client" ends has no such overlap, so both
+			// rules apply independently and correctly.
+			replace(".setScreen(", ".gui.setScreen(")
+			// ActionBarOverlayMixin/PotionTimersModule's InGameHud.class and
+			// import-line usages hit the exact same same-start-position
+			// shielding trap as setScreen above (both start exactly where
+			// the shared bare "InGameHud"->"Gui" rule starts, and a longer,
+			// false-for-26.1 rule there would statically shadow it) -
+			// handled with manual //? if blocks in those two files instead
+			// of here (see the long comment near the end of this file
+			// explaining the general pattern).
+			// EntityType's own constant fields (PLAYER, ZOMBIE, etc.) were
+			// pulled out into a separate EntityTypes class in 26.2 -
+			// verified via javap (EntityType.class itself has zero "static
+			// final EntityType" fields left; they all live on the new
+			// EntityTypes class instead). Fully-qualified so no import
+			// juggling is needed inside CapeFeatureRenderer.java's existing
+			// //? if/else branches.
+			replace("entityType != EntityType.PLAYER", "entityType != net.minecraft.world.entity.EntityTypes.PLAYER")
+			// Items.LIGHTNING_ROD's real type changed from a plain Item to a
+			// WeatheringCopperCollection<Item> in 26.2 (the block gained a
+			// weathering/waxed state family) - verified via javap.
+			// .weathering().unaffected() is the unweathered/default Item,
+			// matching what a plain Items.LIGHTNING_ROD reference meant
+			// before.
+			replace("Items.LIGHTNING_ROD", "Items.LIGHTNING_ROD.weathering().unaffected()")
+		}
+		// --- 26.3: Mojang moved the render API out of com.mojang.blaze3d into a
+		// new com.mojang.renderpearl package (api / backend / frontend split).
+		// Every pair below is an exact fully-qualified class name taken from a
+		// diff of the real 26.2 vs 26.3 client jars (same simple name, new
+		// package) - no rule shares a start position with an older rule.
+		// VulkanBindGroupLayout and glsl.IntermediaryShaderModule have no 26.3
+		// counterpart; the two mixins using them are //? if <26.3 only.
+		// Only for versions at or after the sources' own (1.21.11): Stonecutter applies a false condition in REVERSE,
+		// which turned every Mojmap word back into Yarn in older versions (1.21.10's Map.Entry.getValue() -> getText()).
+		if (current.parsed >= "1.21.11") string(current.parsed >= "26.3") {
+			// 26.3 swapped GLFW for SDL3; the keyboard input type is KEYBOARD
+			// now. Suffix-only so it never starts where "InputUtil" rules do.
+			replace(".Type.KEYSYM", ".Type.KEYBOARD")
+			// One-call API changes in 26.3, each an exact source text that occurs
+			// once in this repo (checked with grep):
+			// PoseStack#mulPose(Quaternionf) -> #rotate(Quaternionfc)
+			replace(".mulPose(new Quaternionf()", ".rotate(new Quaternionf()")
+			// submitModel lost the trailing CrumblingOverlay argument
+			replace("state.outlineColor, null);", "state.outlineColor);")
+			// BundleContents#itemCopyStream -> #itemCopies
+			replace(".itemCopyStream()", ".itemCopies()")
+			// ClientboundLevelChunkWithLightPacket became a record (x()/z())
+			replace("packet.getX(), packet.getZ()", "packet.x(), packet.z()")
+			// ServerboundMoveVehiclePacket now takes a PositionAndRotation
+			replace("new ServerboundMoveVehiclePacket(new Vec3(x, y, z), yaw, pitch, onGround)",
+					"new ServerboundMoveVehiclePacket(net.minecraft.core.PositionAndRotation.of(new Vec3(x, y, z), yaw, pitch), onGround)")
+			replace("p.position().x, p.position().y, p.position().z",
+					"p.movingTo().position().x, p.movingTo().position().y, p.movingTo().position().z")
+			replace("new ServerboundMoveVehiclePacket(new Vec3(decoy.x(), decoy.y(), decoy.z()), p.yRot(), p.xRot(), grounded)",
+					"new ServerboundMoveVehiclePacket(net.minecraft.core.PositionAndRotation.of(new Vec3(decoy.x(), decoy.y(), decoy.z()), p.movingTo().yRot(), p.movingTo().xRot()), grounded)")
+			// LivingEntity#swing takes the item's SwingAnimation now (vanilla passes false too)
+			replace(".swing(net.minecraft.world.InteractionHand.MAIN_HAND);",
+					".swing(net.minecraft.world.InteractionHand.MAIN_HAND, net.minecraft.world.item.component.SwingAnimation.DEFAULT, false);")
+			replace("com.mojang.blaze3d.buffers.GpuBufferSlice", "com.mojang.renderpearl.api.buffers.GpuBufferSlice")
+			replace("com.mojang.blaze3d.buffers.GpuBuffer;", "com.mojang.renderpearl.api.buffers.GpuBuffer;")
+			replace("com.mojang.blaze3d.IndexType", "com.mojang.renderpearl.api.pipeline.IndexType")
+			replace("com.mojang.blaze3d.pipeline.RenderPipeline", "com.mojang.renderpearl.api.pipeline.RenderPipeline")
+			replace("com.mojang.blaze3d.PrimitiveTopology", "com.mojang.renderpearl.api.pipeline.PrimitiveTopology")
+			replace("com.mojang.blaze3d.shaders.ShaderType", "com.mojang.renderpearl.api.pipeline.ShaderType")
+			replace("com.mojang.blaze3d.systems.RenderPass", "com.mojang.renderpearl.api.commands.RenderPass")
+			replace("com.mojang.blaze3d.textures.GpuSampler", "com.mojang.renderpearl.api.textures.GpuSampler")
+			replace("com.mojang.blaze3d.textures.GpuTextureView", "com.mojang.renderpearl.api.textures.GpuTextureView")
+			replace("com.mojang.blaze3d.textures.FilterMode", "com.mojang.renderpearl.api.textures.FilterMode")
+			replace("com.mojang.blaze3d.vulkan.glsl.GlslCompiler", "com.mojang.renderpearl.frontend.shaders.GlslCompiler")
+			replace("com.mojang.blaze3d.vulkan.glsl.ShaderCompileException", "com.mojang.renderpearl.util.ShaderCompileException")
+			replace("com.mojang.blaze3d.vulkan.VulkanDevice", "com.mojang.renderpearl.backend.vulkan.VulkanDevice")
+			replace("com.mojang.blaze3d.vulkan.VulkanGpuBuffer", "com.mojang.renderpearl.backend.vulkan.VulkanGpuBuffer")
+			replace("com.mojang.blaze3d.vulkan.VulkanRenderPass", "com.mojang.renderpearl.backend.vulkan.VulkanRenderPass")
+			replace("com.mojang.blaze3d.vulkan.VulkanRenderPipeline", "com.mojang.renderpearl.backend.vulkan.VulkanRenderPipeline")
+		}
+	}
+}

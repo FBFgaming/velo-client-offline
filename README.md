@@ -1,0 +1,274 @@
+<p align="center"><img src="velo-site/assets/logo.png" width="120" alt="Velo Client logo"></p>
+
+<h1 align="center">Velo Client</h1>
+
+<p align="center"><b>A free Minecraft launcher and Fabric client for 1.21.11, 26.1, 26.2 and 26.3.</b><br>
+More FPS out of the box, 100+ free modules, a HUD you style yourself, friends and parties, PvP tools,
+Redstone Mode and 3D wings, capes and auras every Velo player sees.</p>
+
+<p align="center">
+  <a href="https://velo-client.com"><b>Website</b></a> ·
+  <a href="https://velo-client.com/download"><b>Download</b></a> ·
+  <a href="https://velo-client.com/features">Features</a> ·
+  <a href="https://velo-client.com/store">Store</a> ·
+  <a href="https://discord.gg/tGwn8RsMpv">Discord</a>
+</p>
+
+<p align="center">
+  <a href="https://github.com/velo345/velo-client/releases"><img alt="Latest release" src="https://img.shields.io/github/v/release/velo345/velo-client?include_prereleases&label=release&color=e0262e"></a>
+  <a href="https://github.com/velo345/velo-client/releases"><img alt="Downloads" src="https://img.shields.io/github/downloads/velo345/velo-client/total?color=e0262e"></a>
+  <img alt="Minecraft" src="https://img.shields.io/badge/Minecraft-1.21.11%20%C2%B7%2026.1%20%C2%B7%2026.2%20%C2%B7%2026.3-3a3a44">
+  <img alt="Loader" src="https://img.shields.io/badge/loader-Fabric-3a3a44">
+</p>
+
+<p align="center"><img src="velo-site/assets/gui/launcher-home.webp" width="860" alt="The Velo Client launcher home screen"></p>
+
+## What you get
+
+- **Performance** - Sodium, Lithium and FerriteCore set up for every profile, plus Velo's own render and startup tweaks.
+- **100+ free modules** - FPS, ping, keystrokes, armor, potions, coordinates, zoom, free look, waypoints, world map and many more.
+- **A HUD you design** - drag and drop every element, 8 fonts and 3 looks, themes for launcher and game.
+- **PvP tools** - Target HUD, damage numbers, combo counter, hit colour, cooldowns, totem pops, kill effects.
+- **Redstone Mode** - select, copy, move and stack builds, auto wiring, schematics (Litematica compatible), tick freeze and rewind.
+- **Velo Shaders** - real shadows, volumetric clouds and reflections that run on Vulkan.
+- **Friends and parties** across servers, clips with a replay buffer, World Hosting for your singleplayer worlds.
+- **Cosmetics** - 3D wings, animated HD capes, auras, emotes and name styles that every Velo player sees.
+- **Moves your setup over** from Lunar Client, Modrinth and CurseForge in a few clicks.
+
+The launcher, the client and all modules are free. Velo+ (free 7-day trial) and Store cosmetics are optional.
+
+<p align="center">
+  <img src="velo-site/assets/gui/ingame-rshift.webp" width="420" alt="Velo Client mod menu in game">
+  <img src="velo-site/assets/gui/locker.webp" width="420" alt="Velo Client cosmetics locker">
+</p>
+
+## Download
+
+Get the launcher for **Windows**, **Linux (.deb / .tar.gz)** or **macOS** from [velo-client.com/download](https://velo-client.com/download) or the
+[latest release](https://github.com/velo345/velo-client/releases). In any other Fabric launcher, use the
+`velo-client-<version>+<minecraft>.jar` from the release together with Fabric API.
+
+On macOS pick the disk image for your Mac: `velo-client-launcher-<version>-macos-arm64.dmg` for Apple Silicon
+(M1 and newer), `velo-client-launcher-<version>-macos-x64.dmg` for Intel. The app isn't notarized by Apple yet, so the
+first start needs **right-click → Open** (or **System Settings → Privacy & Security → Open Anyway**).
+
+Velo Client is an independent project and not an official Minecraft product; it is not approved by or associated with
+Mojang or Microsoft.
+
+## Development
+
+### Status
+
+This repository contains a working Fabric mod with 41 modules across
+Performance, Rendering, HUD, Server Tools, QoL, Utility, Debug, and
+Cosmetics, plus a companion JavaFX launcher shell. It has been smoke-tested
+in a real launched client (`./gradlew runClient`), not just compiled.
+
+The marketing site (source and copy under [`velo-site/`](velo-site/)) is
+live at **https://velo-client.com** — including the Imprint and
+Privacy Policy required for a project with an identifiable operator.
+
+### Implemented
+
+- **Gradle + Fabric Loom project** targeting Minecraft 1.21.11 / Java 21,
+  plus a `launcher` Gradle subproject (JavaFX).
+- **Module system**: `Module` / `AbstractModule` / `ModuleRegistry`
+  ([src/main/java/net/veloclient/velo/module/](src/main/java/net/veloclient/velo/module/)),
+  with category + safety-tag metadata, an optional `Configurable` interface
+  for modules with adjustable settings, and a `manifest.json` exporter that's
+  the single source of truth for both the in-game panel and the launcher.
+- **A custom in-game widget toolkit** ([src/client/java/net/veloclient/velo/client/gui/widget/](src/client/java/net/veloclient/velo/client/gui/widget/))
+  instead of vanilla's beveled-gray buttons: an animated flat button, a
+  pill-shaped toggle switch with a sliding knob, a filled-track slider, and a
+  scrollable row region. `VeloWindow` ([gui/window/](src/client/java/net/veloclient/velo/client/gui/window/))
+  is the shared draggable-window base every panel is built on - grab the
+  header to move it, click ✕ to close, with an animated open/close
+  scale+fade. All panels (mod menu, per-module settings, theme editor, cape
+  library, log viewer) are built on this, sized to fit their content instead
+  of overflowing the screen.
+- **Config, profile, and theme systems** under `~/.velo-client/` (per-module
+  JSON, per-server profile snapshots with address-pattern auto-matching, a
+  Safe Mode master switch, and a theme.json shared by the mod and launcher).
+- **In-game panel** (Right Shift by default): draggable window, category
+  tabs, search, per-module toggles, a gear icon opening real settings
+  (sliders/toggles/choices/text fields) for any module that has them, a
+  theme editor, a cape library screen with a real OS-native file picker for
+  importing textures (PowerShell's `OpenFileDialog` on Windows, `osascript`
+  on macOS, kdialog/zenity on Linux — no AWT/Swing, which doesn't reliably
+  run headless-free inside this JVM), an "Open Mods Folder" button, and a
+  live drag-and-drop HUD layout editor with per-element disable and grid
+  snapping.
+- **Profiles**: every module's settings plus the whole HUD layout are saved
+  under named, switchable profiles (create/rename/delete from an in-game
+  tab) instead of one global config — switching applies everything at once.
+- **Command Keybinds**: bind any key to instantly run a chat command (e.g.
+  `/spawn`); add, edit, and delete as many bindings as you want from their
+  own screen, independent of vanilla's fixed keybinding list.
+- **Velo Client branding** on the vanilla title screen and pause menu (a
+  small watermark added via `ScreenEvents`, not a full screen replacement,
+  so vanilla layout/mod compatibility is untouched).
+- **HUD/QoL** (all Always Safe): FPS, ping, coordinates, clock, CPS, armor &
+  durability, potion timers, held item, keystrokes (real bound-key labels,
+  an actual mouse-button shape with live per-button CPS), action bar log,
+  session stats, manual waypoints, toggle-sprint/sneak, and vanilla-style
+  zoom (configurable FOV).
+- **Performance & Rendering**: frame time graph, memory/GC monitor, GPU
+  utilization, particle limiter, **Performance Boost** (presets plus
+  individually-tunable view distance/entities/particles/VSync mode —
+  Off/On/Adaptive — mipmaps and HUD update rate, all applied live),
+  **Motion Blur** (motion-triggered blur using vanilla's own tested post-effect
+  shader, not custom GLSL), a Sodium/Lithium/Iris/Starlight detector,
+  independent FOV sliders (movement/nausea/damage tilt), and Full Bright.
+- **Server Tools**: entity count overlay, chunk boundary + hitbox overlays
+  (toggle vanilla's own F3 debug renderers), world border visualizer, a
+  light-level/mob-spawn heatmap (via the game's `GizmoDrawing` debug-drawing
+  API), a TPS/tick graph, a packet traffic monitor (via a `Mixin` on
+  `ClientConnection`), a particle debug overlay, and an in-game log viewer
+  with filtering, word-wrapping, one-click copy, and session export.
+- **Debug**: resource/shader reload hotkeys, a keybind conflict checker, and
+  an extended block/entity inspector.
+- **Cosmetics**: a cape library with `.velocape` bundle import/export, and a
+  real verlet-integration cloth simulator driving the sway of a cape
+  rendered through vanilla's own `PlayerCapeModel`/`submitModel` pipeline.
+- **Velo Network** (`server/`): a small self-hostable backend (see
+  [server/README.md](server/README.md)) that lets Velo Client users see
+  *each other* - the "which client is this player using" badge and equipped
+  Store cape, previously only ever visible on your own name/cape, now also
+  show for other online Velo Client users pointed at the same server.
+  Identity is proven the same way real Minecraft servers do (join/`hasJoined`
+  against Mojang's session server), so the backend never sees anyone's
+  access token. On by default, pointed at Velo Client's own official server
+  (`https://api.velo-client.com`) - overridable (or turned off entirely)
+  via `network.json`, see server/README.md.
+- **Launcher** (`launcher/`): a JavaFX shell with Home (server ping widget
+  using the real Server List Ping protocol), Mods (reads the mod's exported
+  manifest), Cosmetics, Profiles, Settings, and a Theme Editor — all reading
+  and writing the exact same `~/.velo-client/` files the mod does.
+
+### Known gaps (not implemented, and why)
+
+- **Account sign-in is implemented** ([`launcher/auth/`](launcher/src/main/java/net/veloclient/launcher/auth/) —
+  full device-code Microsoft → Xbox Live → XSTS → Minecraft Services chain)
+  but **won't work until the app's client id is on Mojang's allow-list.**
+  As of 2025, Mojang manually reviews and approves every third-party app
+  before it can reach the Java Edition auth APIs (an anti-phishing measure —
+  see the "Java Edition Game Service API Review" notice linked from
+  `https://aka.ms/AppRegInfo`). The Azure AD app registration itself is a
+  separate, free, self-service step (see below); this allow-list approval is
+  the one piece that requires Mojang's manual sign-off and there's no way
+  around it in code. Until it's approved, sign-in will fail with
+  `HTTP 403 ... "Invalid app registration"` from
+  `api.minecraftservices.com/authentication/login_with_xbox` — everything
+  before that step (device code, Microsoft login, Xbox Live, XSTS) already
+  works correctly, confirmed by that exact error only appearing at the very
+  last call in the chain.
+- **One-click install & launch** (downloading Fabric/libraries/assets and
+  spawning the game JVM) isn't implemented — a separate, large piece of work
+  from auth. The Play button is present but explains this rather than
+  pretending to launch anything.
+- **Code-signed installers / auto-updater.** Needs a signing certificate and
+  a release pipeline this environment doesn't have.
+- **Cosmetic-sync backend now exists** (see "Velo Network" above and
+  [server/README.md](server/README.md)), but only syncs the built-in Store
+  capes - a custom `.velocape` you imported yourself still only renders on
+  your own client, since there's no texture-upload endpoint yet. Remote
+  players' capes also don't get the local player's real-time cloth physics
+  (a fixed rest lean instead) - see `CapeFeatureRenderer`'s class doc for why.
+- **True GPU backdrop blur** for the glass panel look. The current
+  `GlassPanel` approximates it with layered translucency; a real
+  post-processing blur shader is a documented follow-up.
+- **Cape mesh is a single physically-driven rigid segment**, not a full
+  per-vertex soft-body mesh — the `ClothSimulator` itself is a genuine
+  multi-point verlet chain, but the renderer currently uses its first
+  segment's angle to bend vanilla's cape model rather than building custom
+  per-segment geometry. See [`CapeFeatureRenderer`](src/client/java/net/veloclient/velo/client/cosmetics/render/CapeFeatureRenderer.java).
+- **Deep chat modifications** (timestamps, background opacity, filters) and
+  a **minimap** are not implemented — both need more extensive rendering
+  hooks than this pass covered.
+- **Stress-test/benchmark scripting** and the **network latency simulator**
+  from the design brief aren't implemented yet.
+
+## Building
+
+Requires network access on first build (Gradle downloads Minecraft,
+mappings, Fabric API, and JavaFX).
+
+```bash
+./gradlew build          # mod + launcher
+./gradlew :launcher:build  # launcher only
+./gradlew :server:shadowJar  # Velo Network server - see server/README.md
+```
+
+The mod jar is written to `build/libs/velo-client-<version>.jar`. Java 21 is
+required to compile and run; Loom's Gradle toolchain will use whatever JDK
+21+ it finds, or you can point it at one explicitly via
+`org.gradle.java.home` in `gradle.properties`.
+
+### Running a dev client
+
+```bash
+./gradlew runClient
+```
+
+This launches Minecraft 1.21.11 with the mod loaded from source, in an
+isolated `run/` directory (gitignored). **This opens a real, visible game
+window** — it's not headless.
+
+### Running the launcher
+
+```bash
+./gradlew :launcher:run
+```
+
+### Running the Velo Network server
+
+Only needed if you want to see other players' badge/cape - the mod works
+exactly as before without it. Full setup (systemd, TLS, client config) is in
+[server/README.md](server/README.md); the short version:
+
+```bash
+./gradlew :server:shadowJar
+java -jar server/build/libs/velo-server.jar
+```
+
+### Project layout
+
+```
+src/main/java/net/veloclient/velo/           common code (module system, config, profiles)
+src/main/resources/fabric.mod.json           mod metadata / entrypoints
+src/client/java/net/veloclient/velo/client/   client-only code (rendering, keybinds, GUI, modules, mixins)
+src/client/resources/                         client-only assets (lang files, mixin config)
+launcher/src/main/java/net/veloclient/launcher/  standalone JavaFX launcher app
+server/src/main/java/net/veloclient/server/      Velo Network backend (badge/cape sync, see server/README.md)
+```
+
+`src/main` and `src/client` are split via Loom's
+`splitEnvironmentSourceSets()` so common code (module registry, config,
+profile matching) stays decoupled from rendering code — this is what would
+let a future dedicated-server companion plugin (e.g. one that exposes TPS
+for the Server Tools graphs) depend on the common jar without pulling in any
+client classes.
+
+## Contributing a module
+
+1. Implement `Module` (or extend `AbstractModule`) in the appropriate
+   `client/modules/<category>/` package.
+2. For anything that draws to the screen, also implement `HudModule`.
+3. Register it in
+   [`VeloClientMod#registerModules()`](src/client/java/net/veloclient/velo/client/VeloClientMod.java).
+4. If it needs a keybind, reuse `VeloKeybinds.CATEGORY` — `KeyBinding.Category.create()`
+   throws if the same id is registered twice, which will crash the game at
+   startup if a second module creates its own category.
+5. Add a row to the table in [SAFETY.md](SAFETY.md) explaining what data it
+   reads and why that doesn't constitute an advantage. PRs that add a module
+   without a safety rationale won't be merged — see the disallow list in the
+   design brief for what will never be accepted regardless of rationale.
+6. Before considering a rendering-heavy change done, actually run
+   `./gradlew runClient` and look at it — several APIs in this Minecraft
+   version (rendering pipeline, debug HUD entries, keybind categories) don't
+   match older-version tutorials/mods, and only a live run catches
+   registration-order bugs that `compileClientJava` can't.
+
+## License
+
+MIT — see [LICENSE](LICENSE).

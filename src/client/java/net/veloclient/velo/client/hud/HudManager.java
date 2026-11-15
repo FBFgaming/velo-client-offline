@@ -1,0 +1,256 @@
+package net.veloclient.velo.client.hud;
+
+//? if >=1.21.2 {
+import net.fabricmc.fabric.api.client.rendering.v1.hud.HudElementRegistry;
+import net.fabricmc.fabric.api.client.rendering.v1.hud.VanillaHudElements;
+//?}
+import net.minecraft.client.MinecraftClient;
+import net.minecraft.client.gui.DrawContext;
+import net.minecraft.util.Identifier;
+import net.veloclient.velo.module.Module;
+import net.veloclient.velo.module.ModuleRegistry;
+import net.veloclient.velo.client.util.ModuleProfiler;
+
+/**
+ * Draws every enabled {@link HudModule} each frame via Fabric API's layered
+ * {@link HudElementRegistry} - the current HUD rendering system in this
+ * Minecraft version. Attached directly after the vanilla hotbar layer so it
+ * always composites, regardless of accessibility options like subtitles.
+ */
+public final class HudManager {
+
+	private static final Identifier HUD_LAYER_ID = Identifier.of("velo-client", "hud");
+
+	private HudManager() {
+	}
+
+	/** 1.21.1 (no HUD element registry): which vanilla parts Velo's own modules draw instead (VanillaHudGateMixin). */
+	public static boolean hidesVanillaEffects() {
+		return ModuleRegistry.get("potion-timers").map(Module::isEnabled).orElse(false);
+	}
+
+	public static boolean hidesVanillaBossBar() {
+		return ModuleRegistry.get("boss-bar").map(Module::isEnabled).orElse(false);
+	}
+
+	public static boolean hidesVanillaScoreboard() {
+		return ModuleRegistry.get("scoreboard-hud").map(Module::isEnabled).orElse(false);
+	}
+
+	/** 1.21.1: draws Velo's crosshair instead of vanilla's when one is equipped; false = vanilla draws its own. */
+	public static boolean drawCustomCrosshair(DrawContext context) {
+		var module = ModuleRegistry.get("custom-crosshair").orElse(null);
+		MinecraftClient client = MinecraftClient.getInstance();
+		if (!(module instanceof net.veloclient.velo.client.modules.qol.CustomCrosshairModule) || !module.isEnabled()
+				|| !client.options.getPerspective().isFirstPerson()) {
+			return false;
+		}
+		boolean hit = client.targetedEntity instanceof net.minecraft.entity.LivingEntity && client.targetedEntity.isAlive();
+		net.veloclient.velo.client.modules.qol.CustomCrosshairModule.renderIfEquipped(context,
+				context.getScaledWindowWidth(), context.getScaledWindowHeight(), hit);
+		net.veloclient.velo.client.modules.qol.AttackIndicatorModule.renderUnderCrosshair(context,
+				context.getScaledWindowWidth(), context.getScaledWindowHeight(),
+				((net.veloclient.velo.client.modules.qol.CustomCrosshairModule) module).size());
+		return true;
+	}
+
+	public static void register() {
+		//? if <1.21.2 {
+		/*net.fabricmc.fabric.api.client.rendering.v1.HudRenderCallback.EVENT.register(HudManager::onHudRender);
+		*///?} else {
+		HudElementRegistry.attachElementAfter(VanillaHudElements.HOTBAR, HUD_LAYER_ID, HudManager::onHudRender);
+		// Suppress vanilla's own status effect icons (top-right corner)
+		// while our Potion Effect Timers module is enabled, so effects
+		// aren't shown twice in two different styles at once.
+		HudElementRegistry.replaceElement(VanillaHudElements.STATUS_EFFECTS, vanilla -> (context, tickCounter) -> {
+			boolean suppressed = ModuleRegistry.get("potion-timers").map(Module::isEnabled).orElse(false);
+			if (!suppressed) {
+				vanilla.render(context, tickCounter);
+			}
+		});
+		// Replaces (rather than mixin-cancels) vanilla's own crosshair
+		// element while a custom one is equipped and enabled - the crosshair
+		// used to be a dedicated, directly mixin-able InGameHud method, but
+		// the current HUD renderer draws every vanilla element (including
+		// the crosshair) through this same registry, so replacing the
+		// registered element is both the simpler and the only remaining way
+		// to override it.
+		HudElementRegistry.replaceElement(VanillaHudElements.CROSSHAIR, vanilla -> (context, tickCounter) -> {
+			var module = ModuleRegistry.get("custom-crosshair").orElse(null);
+			MinecraftClient client = MinecraftClient.getInstance();
+			if (!(module instanceof net.veloclient.velo.client.modules.qol.CustomCrosshairModule) || !module.isEnabled()
+					|| !client.options.getPerspective().isFirstPerson()) {
+				vanilla.render(context, tickCounter);
+				return;
+			}
+			boolean hit = client.targetedEntity instanceof net.minecraft.entity.LivingEntity && client.targetedEntity.isAlive();
+			net.veloclient.velo.client.modules.qol.CustomCrosshairModule.renderIfEquipped(context,
+					context.getScaledWindowWidth(), context.getScaledWindowHeight(), hit);
+			net.veloclient.velo.client.modules.qol.AttackIndicatorModule.renderUnderCrosshair(context,
+					context.getScaledWindowWidth(), context.getScaledWindowHeight(),
+					((net.veloclient.velo.client.modules.qol.CustomCrosshairModule) module).size());
+		});
+		// Same reasoning as CROSSHAIR above - vanilla's scoreboard sidebar
+		// used to be a directly mixin-cancelable InGameHud method, but it's
+		// drawn through this same registry now. Suppressed (not replaced)
+		// while our own ScoreboardHudModule is enabled, so it doesn't draw
+		// twice in two different positions/styles at once.
+		// Boss bars: drawn (or hidden) by the Boss Bar module while it's on.
+		HudElementRegistry.replaceElement(VanillaHudElements.BOSS_BAR, vanilla -> (context, tickCounter) -> {
+			boolean handled = ModuleRegistry.get("boss-bar").map(Module::isEnabled).orElse(false);
+			if (!handled) {
+				vanilla.render(context, tickCounter);
+			}
+		});
+		HudElementRegistry.replaceElement(VanillaHudElements.SCOREBOARD, vanilla -> (context, tickCounter) -> {
+			boolean handled = ModuleRegistry.get("scoreboard-hud").map(Module::isEnabled).orElse(false);
+			if (!handled) {
+				vanilla.render(context, tickCounter);
+			}
+		});
+		//?}
+	}
+
+	/** Dev profiling only: {@code -Dvelo.profileNoHud=true} leaves Velo's HUD out, to measure what it costs. */
+	private static final boolean PROFILE_NO_HUD = Boolean.getBoolean("velo.profileNoHud");
+
+	private static void onHudRender(DrawContext context, net.minecraft.client.render.RenderTickCounter tickCounter) {
+		if (PROFILE_NO_HUD) {
+			return;
+		}
+		MinecraftClient client = MinecraftClient.getInstance();
+		// A title screen opened while a world is still loaded (a mod, a disconnect): no HUD behind it.
+		if (net.veloclient.velo.client.util.ClientCompat.currentScreen() instanceof net.minecraft.client.gui.screen.TitleScreen) {
+			return;
+		}
+		//? if <26.1 {
+		if (client.options.hudHidden) {
+			return;
+		}
+		//?} else if <26.2 {
+		/*if (client.options.hideGui) {
+			return;
+		}
+		*///?} else {
+		/*if (client.gui.hud.isHidden()) {
+			return;
+		}
+		*///?}
+		// World (and the hotbar, since we're attached right after it) has
+		// already drawn to the framebuffer by this point in the frame, but
+		// every other vanilla HUD element (health/food/XP/chat/etc) and all
+		// our own modules below still haven't - applying the blur pass here
+		// blurs the world without smearing anything drawn on top of it.
+		// 26.2+: the post effects run from TurboHudWholeMixin every frame instead - this hook only runs when the HUD is
+		// rebuilt (Velo's HUD cache / Gnetum: at most 360 times a second), so at high FPS they were only in some frames
+		// and the picture flickered between graded and plain (black with vignette / Black & White).
+		//? if <26.2 {
+		net.veloclient.velo.client.modules.rendering.ColorGradingModule.applyIfActive();
+		net.veloclient.velo.client.modules.rendering.MotionBlurModule.applyIfActive();
+		//?}
+		float tickDelta = tickCounter.getTickProgress(true);
+		int screenWidth = client.getWindow().getScaledWidth();
+		int screenHeight = client.getWindow().getScaledHeight();
+
+		if (net.veloclient.velo.client.redstone.RedstoneMode.active()) {
+			// Redstone Mode replaces the whole Velo HUD with its own overlay (Edit HUD Layout draws it itself).
+			if (!(net.veloclient.velo.client.hud.HudSample.active())) {
+				net.veloclient.velo.client.redstone.RmHud.render(context, screenWidth, screenHeight, tickDelta);
+			}
+			return;
+		}
+		HudAutoLayout.updateThrottled(screenWidth, screenHeight);
+		net.veloclient.velo.client.waypoints.WaypointRenderer.renderHud(context, screenWidth, screenHeight);
+		net.veloclient.velo.client.modules.performance.AntiFarmLagModule.renderItemLabels(context, screenWidth, screenHeight);
+		net.veloclient.velo.client.modules.qol.PartyPingModule.renderHud(context, screenWidth, screenHeight);
+		net.veloclient.velo.client.redstone.RmAnalysis.renderOutside(context, screenWidth, screenHeight);
+		// Velo Turbo: the modules redraw at most 360 times a second; frames in between reuse what they drew. In whole-HUD
+		// mode the recording already wraps the entire HUD (TurboHudWholeMixin) - the modules just draw into it.
+		boolean whole = HudFrameCache.wholeHud();
+		if (!whole && HudFrameCache.replay(context, screenWidth, screenHeight)) {
+			net.veloclient.velo.client.youtube.YouTubeModule.renderHud(context, screenWidth, screenHeight);
+		net.veloclient.velo.client.report.SpikeRecorder.renderHud(context, screenWidth);
+		net.veloclient.velo.client.social.NotificationOverlay.renderHud(context, screenWidth, screenHeight);
+			return;
+		}
+		if (!whole) {
+			HudFrameCache.beginRecord(context, screenWidth, screenHeight);
+		}
+		boolean completed = false;
+		try {
+			for (Module module : ModuleRegistry.all()) {
+				if (!(module instanceof HudModule hud) || !hud.isEnabled()) {
+					continue;
+				}
+				if (!ModuleProfiler.enabled) {
+					// No lambda per module per frame unless the Module Profiler overlay is actually open.
+					renderScaled(context, hud, screenWidth, screenHeight, tickDelta);
+					continue;
+				}
+				ModuleProfiler.time(hud.id(), ModuleProfiler.Phase.HUD_RENDER,
+						() -> renderScaled(context, hud, screenWidth, screenHeight, tickDelta));
+			}
+			completed = true;
+		} finally {
+			if (!whole) {
+				HudFrameCache.endRecord(context, completed);
+			}
+		}
+		net.veloclient.velo.client.youtube.YouTubeModule.renderHud(context, screenWidth, screenHeight);
+		net.veloclient.velo.client.report.SpikeRecorder.renderHud(context, screenWidth);
+		net.veloclient.velo.client.social.NotificationOverlay.renderHud(context, screenWidth, screenHeight);
+	}
+
+	/** Renders one HUD element at its configured position, scaled outward from its own top-left corner. */
+	public static void renderScaled(DrawContext context, HudModule hud, int screenWidth, int screenHeight, float tickDelta) {
+		float scale = hud.position().scale();
+		int scaledWidth = Math.round(hud.width() * scale);
+		int scaledHeight = Math.round(hud.height() * scale);
+		int x = hud.position().resolveX(screenWidth, scaledWidth);
+		int y = hud.position().resolveY(screenHeight, scaledHeight);
+
+		// Scoreboard is deliberately excluded from HUD small caps - vanilla's
+		// own scoreboard is exempt (there's no mixin over it, only a
+		// suppress-and-replace above), so a small-capped ScoreboardHudModule
+		// would be the only scoreboard styling that ever looks different,
+		// which reads as inconsistent rather than as the intended effect.
+		boolean smallCapsEligible = !hud.id().equals("scoreboard-hud");
+		if (smallCapsEligible) {
+			net.veloclient.velo.client.modules.qol.SmallCapsModule.setHudRenderActive(true);
+		}
+		// HUD modules keep the vanilla font even when drawn inside the HUD editor (a Velo screen).
+		net.veloclient.velo.client.gui.VeloFonts.beginHud();
+		// Text in a scaled element picks the glyph atlas for its real on-screen size (was the GUI scale's: blocky at 150%).
+		float previousPoseScale = net.veloclient.velo.client.gui.VeloFonts.setHudPoseScale(scale);
+		boolean pushed = false;
+		try {
+			if (scale == 1.0f) {
+				hud.render(context, x, y, tickDelta);
+				return;
+			}
+			context.getMatrices().pushMatrix();
+			pushed = true;
+			context.getMatrices().translate((float) x, (float) y);
+			context.getMatrices().scale(scale, scale);
+			context.getMatrices().translate((float) -x, (float) -y);
+			hud.render(context, x, y, tickDelta);
+		} catch (RuntimeException e) {
+			// A broken HUD element used to crash the whole game (an exception on the render thread).
+			// Turn just that module off and say so instead.
+			org.slf4j.LoggerFactory.getLogger("velo-client").error("HUD module {} crashed while drawing - turned it off", hud.id(), e);
+			hud.setEnabled(false);
+			net.veloclient.velo.client.social.NotificationOverlay.show(new net.veloclient.velo.client.social.NotificationOverlay.Toast(null, null,
+					hud.displayName() + " turned off", "It ran into an error while drawing. Please send a bug report from the pause menu.",
+					8000, null, null, null));
+		} finally {
+			if (pushed) {
+				context.getMatrices().popMatrix();
+			}
+			net.veloclient.velo.client.gui.VeloFonts.setHudPoseScale(previousPoseScale);
+			net.veloclient.velo.client.gui.VeloFonts.endHud();
+			if (smallCapsEligible) {
+				net.veloclient.velo.client.modules.qol.SmallCapsModule.setHudRenderActive(false);
+			}
+		}
+	}
+}

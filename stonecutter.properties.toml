@@ -1,0 +1,43 @@
+# Properties shared across every targeted Minecraft version. Per-version
+# overrides (mappings, Fabric API build, etc.) live in the [version] tables
+# below - see https://stonecutter.kikugie.dev/wiki/config/properties
+mod.id = "velo-client"
+mod.name = "Velo Client"
+mod.group = "net.veloclient"
+mod.version = "1.4.1"
+
+deps.fabric_loader = "0.19.5"
+loomx.loom_version = "1.17-SNAPSHOT"
+
+["1.21.1"]
+# Yarn; last builds of both (meta.fabricmc.net / maven.fabricmc.net).
+deps.yarn_mappings = "1.21.1+build.3"
+deps.fabric_api = "0.116.17+1.21.1"
+
+["1.21.10"]
+# Yarn like 1.21.11; the last build of both, verified against meta.fabricmc.net / maven.fabricmc.net.
+deps.yarn_mappings = "1.21.10+build.3"
+deps.fabric_api = "0.138.4+1.21.10"
+
+["1.21.11"]
+# Known-working config this project already shipped with before the
+# Stonecutter migration - unchanged on purpose so this version keeps
+# building exactly as it did.
+deps.yarn_mappings = "1.21.11+build.6"
+deps.fabric_api = "0.141.4+1.21.11"
+
+["26.1"]
+# 26.1+ ships Mojang's own official mappings, so there's no Yarn build to
+# pin here - see build.gradle.kts's loomx.applyMojangMappings() call.
+# Verified against maven.fabricmc.net's real metadata (0.145.1+26.1 is the
+# latest build tagged for bare "26.1", before Fabric API moved to the
+# "+26.1.1"/"+26.1.2" patch-suffixed builds).
+deps.fabric_api = "0.145.1+26.1"
+
+["26.2"]
+# Verified against maven.fabricmc.net's real metadata - latest available.
+deps.fabric_api = "0.156.0+26.2"
+
+["26.3"]
+# Verified against maven.fabricmc.net's real metadata - latest available.
+deps.fabric_api = "0.162.0+26.3"

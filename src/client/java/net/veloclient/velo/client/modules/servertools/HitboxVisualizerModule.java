@@ -1,0 +1,218 @@
+package net.veloclient.velo.client.modules.servertools;
+
+import net.fabricmc.fabric.api.client.rendering.v1.world.WorldRenderContext;
+import net.fabricmc.fabric.api.client.rendering.v1.world.WorldRenderEvents;
+import net.minecraft.client.MinecraftClient;
+import net.minecraft.client.network.PlayerListEntry;
+import net.minecraft.client.render.DrawStyle;
+import net.minecraft.client.world.ClientWorld;
+import net.minecraft.entity.Entity;
+import net.minecraft.entity.player.PlayerEntity;
+//? if <26.1 {
+import net.minecraft.entity.boss.dragon.EnderDragonEntity;
+import net.minecraft.entity.boss.dragon.EnderDragonPart;
+import net.minecraft.world.GameMode;
+//?} else {
+/*import net.minecraft.world.entity.boss.enderdragon.EnderDragon;
+import net.minecraft.world.entity.boss.enderdragon.EnderDragonPart;
+import net.minecraft.world.level.GameType;
+*///?}
+import net.minecraft.world.debug.gizmo.GizmoDrawing;
+import net.veloclient.velo.module.AbstractModule;
+import net.veloclient.velo.module.ConfigField;
+import net.veloclient.velo.module.Configurable;
+import net.veloclient.velo.module.ModuleCategory;
+import net.veloclient.velo.module.SafetyTag;
+import net.veloclient.velo.client.util.ModuleProfiler;
+
+import java.util.List;
+
+/**
+ * Renders entity hitbox outlines - informational only, for plugin/build hitbox debugging, not a
+ * combat aid (it draws the exact box the server already uses, {@code Entity#getBoundingBox()},
+ * nothing wider). Off by default and tagged Check Server Rules since some servers disallow any
+ * hitbox rendering (design spec 6.3).
+ *
+ * <p>Its own renderer rather than a toggle over vanilla's F3 hitbox debug entry (which this
+ * module used to just delegate to) - vanilla's own rendering is a fixed color with no way to
+ * customize it, and the whole point of making this {@link Configurable} is letting players pick
+ * a color/line width that's actually visible against their server's terrain.
+ *
+ * <p>Deliberately normal depth-tested rendering, not drawn through walls - this is informational
+ * (the exact box the server already sends for entities you can already see), never an X-ray; a
+ * box visible through terrain would show entities that aren't otherwise visible at all, which is
+ * exactly the kind of advantage this client's own {@link SafetyTag} categories rule out. The
+ * local player's own box is skipped too - nothing useful about drawing a box around yourself.
+ */
+public final class HitboxVisualizerModule extends AbstractModule implements Configurable {
+
+	/** Entity groups with their own color and on/off switch. */
+	private enum Kind {
+		PLAYERS("Players", 0xFF4FC3F7),
+		HOSTILE("Hostile Mobs", 0xFFFF5252),
+		PASSIVE("Passive Mobs", 0xFF69F0AE),
+		PROJECTILES("Projectiles", 0xFFFFD740),
+		ITEMS("Items & XP", 0xFFE0E0E0),
+		OTHER("Other", 0xFFFFFF00);
+
+		final String label;
+		final int defaultColor;
+
+		Kind(String label, int defaultColor) {
+			this.label = label;
+			this.defaultColor = defaultColor;
+		}
+	}
+
+	private final int[] colors = new int[Kind.values().length];
+	private final boolean[] shown = new boolean[Kind.values().length];
+	private double lineWidth = 1.5;
+
+	public HitboxVisualizerModule() {
+		super("hitbox-visualizer", "Hitbox Visualizer",
+				"Renders entity hitbox outlines for build/plugin testing, with a customizable color and line width.",
+				ModuleCategory.SERVER_TOOLS, SafetyTag.CHECK_SERVER_RULES, false);
+		for (Kind kind : Kind.values()) {
+			colors[kind.ordinal()] = kind.defaultColor;
+			shown[kind.ordinal()] = true;
+		}
+		WorldRenderEvents.BEFORE_DEBUG_RENDER.register(context ->
+				ModuleProfiler.time(id(), ModuleProfiler.Phase.WORLD_RENDER, () -> onRender(context)));
+	}
+
+	private void onRender(WorldRenderContext context) {
+		if (!isEnabled()) {
+			return;
+		}
+		MinecraftClient client = MinecraftClient.getInstance();
+		ClientWorld world = client.world;
+		if (world == null) {
+			return;
+		}
+		DrawStyle[] styles = new DrawStyle[Kind.values().length];
+		for (Kind kind : Kind.values()) {
+			styles[kind.ordinal()] = DrawStyle.stroked(colors[kind.ordinal()], (float) lineWidth);
+		}
+		for (Entity entity : world.getEntities()) {
+			if (entity == client.player || !isVisible(client, entity)) {
+				continue;
+			}
+			Kind kind = kindOf(entity);
+			if (!shown[kind.ordinal()]) {
+				continue;
+			}
+			DrawStyle style = styles[kind.ordinal()];
+			//? if <26.1 {
+			if (entity instanceof EnderDragonEntity dragon) {
+			//?} else {
+			/*if (entity instanceof EnderDragon dragon) {
+			*///?}
+				// A dragon's overall getBoundingBox() doesn't match what the
+				// server actually hit-tests against - it's hit-tested per
+				// body part (head/neck/body/wings/tail), each with its own
+				// box, so draw those instead of one big approximate box.
+				//? if <26.1 {
+				for (EnderDragonPart part : dragon.getBodyParts()) {
+				//?} else {
+				/*for (EnderDragonPart part : dragon.getSubEntities()) {
+				*///?}
+					GizmoDrawing.box(velo$lerped(part, part.getBoundingBox()), style);
+				}
+				continue;
+			}
+			GizmoDrawing.box(velo$lerped(entity, entity.getBoundingBox()), style);
+		}
+	}
+
+	/**
+	 * The box where the entity is drawn this frame: getBoundingBox() sits at the last tick position (20 a second), the
+	 * model at the frame's interpolated one - so the box trailed behind moving players and stepped.
+	 */
+	//? if <26.1 {
+	private static net.minecraft.util.math.Box velo$lerped(Entity entity, net.minecraft.util.math.Box box) {
+		double[] p = net.veloclient.velo.client.pvp.PvpCompat.renderPos(entity);
+		return box.offset(p[0] - entity.getX(), p[1] - entity.getY(), p[2] - entity.getZ());
+	}
+	//?} else {
+	/*private static net.minecraft.world.phys.AABB velo$lerped(Entity entity, net.minecraft.world.phys.AABB box) {
+		double[] p = net.veloclient.velo.client.pvp.PvpCompat.renderPos(entity);
+		return box.move(p[0] - entity.getX(), p[1] - entity.getY(), p[2] - entity.getZ());
+	}
+	*///?}
+
+	private static Kind kindOf(Entity entity) {
+		if (entity instanceof PlayerEntity) {
+			return Kind.PLAYERS;
+		}
+		//? if <26.1 {
+		if (entity instanceof net.minecraft.entity.projectile.ProjectileEntity) {
+			return Kind.PROJECTILES;
+		}
+		if (entity instanceof net.minecraft.entity.ItemEntity || entity instanceof net.minecraft.entity.ExperienceOrbEntity) {
+			return Kind.ITEMS;
+		}
+		if (entity instanceof net.minecraft.entity.mob.Monster || entity instanceof EnderDragonEntity) {
+			return Kind.HOSTILE;
+		}
+		if (entity instanceof net.minecraft.entity.LivingEntity && !(entity instanceof net.minecraft.entity.decoration.ArmorStandEntity)) {
+			return Kind.PASSIVE;
+		}
+		//?} else {
+		/*if (entity instanceof net.minecraft.world.entity.projectile.Projectile) {
+			return Kind.PROJECTILES;
+		}
+		if (entity instanceof net.minecraft.world.entity.item.ItemEntity || entity instanceof net.minecraft.world.entity.ExperienceOrb) {
+			return Kind.ITEMS;
+		}
+		if (entity instanceof net.minecraft.world.entity.monster.Enemy || entity instanceof EnderDragon) {
+			return Kind.HOSTILE;
+		}
+		if (entity instanceof net.minecraft.world.entity.LivingEntity && !(entity instanceof net.minecraft.world.entity.decoration.ArmorStand)) {
+			return Kind.PASSIVE;
+		}
+		*///?}
+		return Kind.OTHER;
+	}
+
+	/**
+	 * Only draw boxes for entities the player can actually see: invisible
+	 * entities (covers vanish-via-invisibility, not just players) and
+	 * players in spectator mode are skipped rather than exposed through this
+	 * debug tool.
+	 */
+	private static boolean isVisible(MinecraftClient client, Entity entity) {
+		if (entity.isInvisible()) {
+			return false;
+		}
+		if (entity instanceof PlayerEntity player) {
+			var networkHandler = client.getNetworkHandler();
+			PlayerListEntry entry = networkHandler == null ? null : networkHandler.getPlayerListEntry(player.getUuid());
+			// No player-list entry (e.g. NPC-ish fake players some servers
+			// spawn) means we can't tell their gamemode - keep showing
+			// rather than guess.
+			//? if <26.1 {
+			if (entry != null && entry.getGameMode() == GameMode.SPECTATOR) {
+				return false;
+			}
+			//?} else {
+			/*if (entry != null && entry.getGameMode() == GameType.SPECTATOR) {
+				return false;
+			}
+			*///?}
+		}
+		return true;
+	}
+
+	@Override
+	public List<ConfigField> configFields() {
+		List<ConfigField> fields = new java.util.ArrayList<>();
+		for (Kind kind : Kind.values()) {
+			int i = kind.ordinal();
+			fields.add(new ConfigField.ToggleField("Show " + kind.label, () -> shown[i], v -> shown[i] = v));
+			fields.add(new ConfigField.ColorField(kind.label + " Color", () -> colors[i], v -> colors[i] = v, true));
+		}
+		fields.add(new ConfigField.SliderField("Line Width", 0.5, 4.0, () -> lineWidth,
+				v -> lineWidth = v, v -> String.format(java.util.Locale.ROOT, "%.1f", v)));
+		return fields;
+	}
+}

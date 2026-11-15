@@ -1,0 +1,273 @@
+package net.veloclient.velo.client.gui;
+
+import net.minecraft.client.gl.RenderPipelines;
+import net.minecraft.client.gui.DrawContext;
+import net.minecraft.text.MutableText;
+import net.minecraft.text.Style;
+import net.minecraft.text.Text;
+import net.minecraft.util.Identifier;
+
+/**
+ * The small "which client is this player using" badge shown next to the
+ * local player's own name - tab list ({@link net.veloclient.velo.client.mixin.PlayerListHudMixin}),
+ * chat ({@link net.veloclient.velo.client.mixin.ChatHudMixin}), and the
+ * in-world nametag above their own head ({@link net.veloclient.velo.client.mixin.PlayerNameTagBadgeMixin})
+ * all draw the exact same icon through here, same as Lunar/NoRisk-style
+ * clients. Drawn from the mod's own 500x500 logo asset (already used for the
+ * title-screen watermark, see {@link VeloBranding}) rather than a
+ * separately-shipped tiny icon, since sampling a real high-resolution source
+ * down to badge size looks meaningfully sharper than a source image that was
+ * already only badge-sized to begin with.
+ *
+ * <p>Own-name badging ({@link #isOwnName}) is always local-only, exactly like
+ * the cape/crosshair systems - nothing about it is ever sent anywhere. {@link
+ * #isKnownVeloName} additionally badges other players, but only if a Velo
+ * Client server is configured (see {@code network.json},
+ * {@link net.veloclient.velo.client.network.VeloServerClient}) - with none
+ * configured it behaves identically to {@link #isOwnName}.
+ *
+ * <p>The chat variant ({@link #prefixWithBadge}) can't just draw an icon at
+ * render time like the other two - the visible chat text is pre-formatted
+ * Text the server sends back, not something rendered from separately-known
+ * name/message parts this mod controls, so there's no isolated "draw the
+ * name" call to hook the way {@code PlayerListHudMixin} does. Instead it
+ * prepends a real glyph from a custom bitmap font (see {@code
+ * assets/velo-client/font/badge.json}, built from this same logo) styled
+ * onto a private-use-area character, which then just rides along through
+ * Minecraft's normal text rendering - no separate render hook needed there.
+ */
+public final class VeloBadge {
+
+	// Tab list rows are only ~9px tall (font height) - 11px visibly
+	// overflowed the row. 6px sits cleanly inside it without looking
+	// pixelated, since this is still sampled down from the real 500x500
+	// source texture rather than a small pre-shrunk one. PlayerListHudMixin
+	// centers it against the actual row height using this constant, so it
+	// stays centered at any size.
+	public static final int SIZE = 6;
+
+	private static final Identifier LOGO_TEXTURE = Identifier.of("velo-client", "textures/icon/logo.png");
+	private static final int LOGO_SOURCE_SIZE = 500;
+	// A private-use-area codepoint (U+E050), matched exactly by the
+	// "chars" entry in assets/velo-client/font/badge.json's bitmap
+	// provider.
+	private static final String GLYPH = "";
+	/** The Velo+ badge (U+E051): the logo with a red plus behind it - 192 x 128, so 1.5 times as wide as it is tall. */
+	private static final String PLUS_GLYPH = "\uE051";
+	private static final Identifier PLUS_TEXTURE = Identifier.of("velo-client", "textures/font/badge_plus_glyph.png");
+	/** The OG badge (U+E052): the logo in gold and "OG" - 256 x 128, twice as wide as it is tall. See OgBadgeSetting. */
+	private static final String OG_GLYPH = "\uE052";
+	private static final Identifier OG_TEXTURE = Identifier.of("velo-client", "textures/font/badge_og_glyph.png");
+
+	/** Which badge: the logo, the Velo+ one, or the OG one (OG wins - it's the one the player chose). */
+	public static final int NORMAL = 0;
+	public static final int PLUS = 1;
+	public static final int OG = 2;
+
+	private VeloBadge() {
+	}
+
+	/**
+	 * True if {@code text} contains {@code ownName} as a genuine, whole
+	 * username - not just as a substring of some other, longer name. A
+	 * plain {@code String#contains} check wrongly matched "r4wwrrr" inside
+	 * a completely different player's name "r4wwrrrr", badging both of them
+	 * in the tab list - Minecraft usernames are restricted to
+	 * {@code [a-zA-Z0-9_]}, so this rejects a match unless the characters
+	 * immediately before/after it (if any) fall outside that set.
+	 */
+	public static boolean isOwnName(String text, String ownName) {
+		int index = text.indexOf(ownName);
+		if (index < 0) {
+			return false;
+		}
+		boolean boundaryBefore = index == 0 || !isNameChar(text.charAt(index - 1));
+		int after = index + ownName.length();
+		boolean boundaryAfter = after >= text.length() || !isNameChar(text.charAt(after));
+		return boundaryBefore && boundaryAfter;
+	}
+
+	/**
+	 * Same whole-word match as {@link #isOwnName}, but also true for anyone
+	 * currently online with Velo Client on the server configured in {@code
+	 * network.json} (see {@link net.veloclient.velo.client.network.VeloServerClient},
+	 * {@link net.veloclient.velo.client.network.VeloUserRegistry}) - without
+	 * that configured, {@code onlineUsernames()} is always empty and this is
+	 * exactly {@link #isOwnName}, i.e. no behavior change for anyone who
+	 * hasn't opted into a server.
+	 */
+	public static boolean isKnownVeloName(String text, String ownName) {
+		if (isOwnName(text, ownName)) {
+			return true;
+		}
+		if (net.veloclient.velo.client.network.VeloUserRegistry.onlineUsernames().isEmpty()) {
+			return false;
+		}
+		// Walks each whole [a-zA-Z0-9_] run in the text once and does a hash lookup, instead of
+		// an indexOf() scan per online user - that was (tab rows x online users) string searches
+		// every frame, which got expensive with a busy Velo server.
+		int length = text.length();
+		int start = -1;
+		for (int i = 0; i <= length; i++) {
+			boolean nameChar = i < length && isNameChar(text.charAt(i));
+			if (nameChar && start < 0) {
+				start = i;
+			} else if (!nameChar && start >= 0) {
+				int runLength = i - start;
+				if (runLength >= 3 && runLength <= 16
+						&& net.veloclient.velo.client.network.VeloUserRegistry.isOnlineName(text.substring(start, i))) {
+					return true;
+				}
+				start = -1;
+			}
+		}
+		return false;
+	}
+
+	/**
+	 * Whether the name in {@code text} (yours, or an online player's) belongs to a Velo+ member - they get the
+	 * badge with the plus behind it. Only asked once {@link #isKnownVeloName} said the name has a badge.
+	 */
+	public static boolean isPlus(String text, String ownName) {
+		if (isOwnName(text, ownName) && net.veloclient.velo.client.network.StoreClient.plus()) {
+			return true;
+		}
+		int length = text.length();
+		int start = -1;
+		for (int i = 0; i <= length; i++) {
+			boolean nameChar = i < length && isNameChar(text.charAt(i));
+			if (nameChar && start < 0) {
+				start = i;
+			} else if (!nameChar && start >= 0) {
+				int runLength = i - start;
+				if (runLength >= 3 && runLength <= 16 && net.veloclient.velo.client.network.VeloUserRegistry.isPlusName(text.substring(start, i))) {
+					return true;
+				}
+				start = -1;
+			}
+		}
+		return false;
+	}
+
+	/** Your own badge: OG when you chose it (and may), else Velo+ when you're a member. */
+	public static int ownKind() {
+		if (net.veloclient.velo.client.network.OgBadgeSetting.showing()) {
+			return OG;
+		}
+		return net.veloclient.velo.client.network.StoreClient.plus() ? PLUS : NORMAL;
+	}
+
+	/** Another player's badge (UUID first, then name). */
+	public static int kindOf(java.util.UUID uuid, String name) {
+		if (net.veloclient.velo.client.network.VeloUserRegistry.isOg(uuid, name)) {
+			return OG;
+		}
+		return net.veloclient.velo.client.network.VeloUserRegistry.isPlus(uuid, name) ? PLUS : NORMAL;
+	}
+
+	/** The badge for the name in {@code text} (yours or an online player's) - only asked once {@link #isKnownVeloName} said it has one. */
+	public static int kind(String text, String ownName) {
+		if (isOwnName(text, ownName)) {
+			return ownKind();
+		}
+		int length = text.length();
+		int start = -1;
+		boolean plus = false;
+		for (int i = 0; i <= length; i++) {
+			boolean nameChar = i < length && isNameChar(text.charAt(i));
+			if (nameChar && start < 0) {
+				start = i;
+			} else if (!nameChar && start >= 0) {
+				int runLength = i - start;
+				if (runLength >= 3 && runLength <= 16) {
+					String run = text.substring(start, i);
+					if (net.veloclient.velo.client.network.VeloUserRegistry.isOgName(run)) {
+						return OG;
+					}
+					plus |= net.veloclient.velo.client.network.VeloUserRegistry.isPlusName(run);
+				}
+				start = -1;
+			}
+		}
+		return plus ? PLUS : NORMAL;
+	}
+
+	private static boolean isNameChar(char c) {
+		return Character.isLetterOrDigit(c) || c == '_';
+	}
+
+	/** Draws the badge at {@code (x, y)} on-screen, {@link #SIZE} pixels square. */
+	public static void draw(DrawContext context, int x, int y) {
+		draw(context, x, y, false);
+	}
+
+	/** The badge's width: {@link #SIZE}, or 1.5 times that for the Velo+ one (logo and plus). */
+	public static int width(boolean plus) {
+		return plus ? SIZE * 3 / 2 : SIZE;
+	}
+
+	/** The width of badge {@code kind} ({@link #NORMAL}, {@link #PLUS}, {@link #OG}). */
+	public static int width(int kind) {
+		return kind == OG ? SIZE * 2 : width(kind == PLUS);
+	}
+
+	/** Draws badge {@code kind}. */
+	public static void draw(DrawContext context, int x, int y, int kind) {
+		if (kind == OG) {
+			context.drawTexture(RenderPipelines.GUI_TEXTURED, OG_TEXTURE, x, y, 0f, 0f, width(OG), SIZE, 256, 128, 256, 128);
+			return;
+		}
+		draw(context, x, y, kind == PLUS);
+	}
+
+	/** Draws the badge, or the Velo+ one (the logo with a red plus behind it). */
+	public static void draw(DrawContext context, int x, int y, boolean plus) {
+		if (plus) {
+			context.drawTexture(RenderPipelines.GUI_TEXTURED, PLUS_TEXTURE, x, y, 0f, 0f, width(true), SIZE, 192, 128, 192, 128);
+			return;
+		}
+		context.drawTexture(RenderPipelines.GUI_TEXTURED, LOGO_TEXTURE, x, y, 0f, 0f,
+				SIZE, SIZE, LOGO_SOURCE_SIZE, LOGO_SOURCE_SIZE, LOGO_SOURCE_SIZE, LOGO_SOURCE_SIZE);
+	}
+
+	/**
+	 * Prepends the badge glyph (custom bitmap font, see class doc) to a chat
+	 * line or nametag.
+	 *
+	 * <p>The glyph and {@code original} are added as two independent
+	 * children of a neutral empty root, NOT as {@code glyph.append(original)}
+	 * directly - Minecraft's real text style resolution has the badge's
+	 * custom-font style cascade down into any component nested inside it
+	 * (the same mechanism that makes {@code Text.literal("a").formatted(RED)
+	 * .append("b")} render "b" in red too), and the badge font has no glyphs
+	 * defined for anything but the one private-use character - so
+	 * {@code original} inherited it and rendered as unreadable
+	 * missing-glyph boxes for every real letter. As two siblings under a
+	 * plain, unstyled root instead of one being the other's ancestor, only
+	 * the glyph itself resolves the custom font - {@code original} falls
+	 * through to the normal default one, untouched.
+	 */
+	public static Text prefixWithBadge(Text original) {
+		return prefixWithBadge(original, false);
+	}
+
+	/** Same, with the Velo+ badge (logo and a red plus) when {@code plus}. */
+	public static Text prefixWithBadge(Text original, boolean plus) {
+		return prefixWithBadge(original, plus ? PLUS : NORMAL);
+	}
+
+	/** Same, with badge {@code kind}. */
+	public static Text prefixWithBadge(Text original, int kind) {
+		boolean plus = kind == PLUS;
+		Identifier fontId = Identifier.of("velo-client", "badge");
+		//? if <26.1 {
+		Style badgeStyle = Style.EMPTY.withFont(new net.minecraft.text.StyleSpriteSource.Font(fontId));
+		//?} else {
+		/*Style badgeStyle = Style.EMPTY.withFont(new net.minecraft.network.chat.FontDescription.Resource(fontId));
+		*///?}
+		MutableText result = Text.empty();
+		result.append(Text.literal(kind == OG ? OG_GLYPH : plus ? PLUS_GLYPH : GLYPH).setStyle(badgeStyle));
+		result.append(original);
+		return result;
+	}
+}

@@ -1,0 +1,307 @@
+package net.veloclient.velo.client.cosmetics;
+
+import net.minecraft.client.MinecraftClient;
+import net.minecraft.client.texture.NativeImage;
+import net.minecraft.client.texture.NativeImageBackedTexture;
+import net.minecraft.util.Identifier;
+
+import java.io.IOException;
+import java.io.InputStream;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
+
+/**
+ * Registers one stable {@link Identifier} per animated cape whose bound
+ * texture's pixel content is swapped in place, frame by frame, rather than
+ * registering (or looking up) a different identifier per frame.
+ *
+ * <p>That's what makes animated capes "just work" everywhere a cape texture
+ * identifier is already read - {@link CapeManager#textureIdentifier}, {@link
+ * net.veloclient.velo.client.cosmetics.render.CapeFeatureRenderer}, the cape
+ * library tiles, and (via {@link net.veloclient.velo.client.mixin.LocalPlayerSkinCapeMixin})
+ * Wavey Capes' own fallback renderer - none of them need to know or care that
+ * the texture behind that identifier is animated at all; they just keep
+ * sampling the same identifier every frame like they always did, and the GPU
+ * content underneath happens to be changing.
+ *
+ * <p>Frame swaps never call {@link NativeImageBackedTexture#setImage}, which
+ * closes whatever image was previously assigned to it - the decoded frames
+ * are a persistent, reusable master list (read from repeatedly, forever), not
+ * something that can be handed away and closed. Instead each tick copies the
+ * next frame's pixels (just the used cape region - see {@link GifDecoder})
+ * into the texture's own backing image, leaving the master frames untouched.
+ */
+public final class AnimatedCapeAsset {
+
+	private static final Map<String, AnimatedCapeAsset> REGISTRY = new LinkedHashMap<>();
+
+	private final Identifier identifier;
+	private final NativeImageBackedTexture texture;
+	private final List<GifDecoder.Frame> frames;
+	private final int width;
+	private final int height;
+	/** Decoded from a source that can be read again (store / bundled cape) - safe to free when idle. */
+	private boolean reloadable;
+	/** The matching elytra texture (see {@link ElytraArt}); created on first request, then repainted with every frame. */
+	private Identifier elytraId;
+	private NativeImageBackedTexture elytraTexture;
+	/** Last time the elytra texture was asked for - it is only repainted while an elytra is actually being drawn. */
+	private long elytraUsedNanos;
+	private int frameIndex = -1;
+	private long lastFrameChangeNanos;
+	/** The cloak you wear: always animates at full rate (set in tickAll). */
+	private boolean owned;
+	private long msIntoCurrentFrame;
+	private long lastAdvanceNanos = -1;
+	/** Last time something asked for this texture (i.e. it's being drawn) - see {@link #tickAll}. */
+	private volatile long lastUsedNanos = System.nanoTime();
+
+	private AnimatedCapeAsset(Identifier identifier, NativeImageBackedTexture texture, List<GifDecoder.Frame> frames, int width, int height) {
+		this.identifier = identifier;
+		this.texture = texture;
+		this.frames = frames;
+		this.width = width;
+		this.height = height;
+	}
+
+	/** Decodes and registers {@code gifPath} (a resource path, e.g. from a store cape or an imported bundle's {@code frames.gif}) under a texture id derived from {@code capeId}, or returns the already-registered one. */
+	public static synchronized AnimatedCapeAsset getOrRegister(String capeId, java.util.function.Supplier<InputStream> gifSource) {
+		AnimatedCapeAsset existing = REGISTRY.get(capeId);
+		if (existing != null) {
+			existing.lastUsedNanos = System.nanoTime();
+			return existing;
+		}
+		return REGISTRY.computeIfAbsent(capeId, id -> {
+			try (InputStream in = gifSource.get()) {
+				AnimatedCapeAsset created = create(id, GifDecoder.decode(in));
+				created.reloadable = true;
+				return created;
+			} catch (IOException e) {
+				throw new RuntimeException("Failed to decode animated cloak texture for " + id, e);
+			}
+		});
+	}
+
+	/** Registers an already-decoded GIF (decoded off-thread, e.g. another player's downloaded cape). Render thread only. */
+	public static synchronized AnimatedCapeAsset registerDecoded(String capeId, GifDecoder.Result decoded) throws IOException {
+		return registerDecoded(capeId, decoded, false);
+	}
+
+	/** {@code reloadable}: it can be decoded again from its source, so it's freed after a minute out of view. */
+	public static synchronized AnimatedCapeAsset registerDecoded(String capeId, GifDecoder.Result decoded, boolean reloadable) throws IOException {
+		AnimatedCapeAsset existing = REGISTRY.get(capeId);
+		if (existing != null) {
+			return existing;
+		}
+		AnimatedCapeAsset created = create(capeId, decoded);
+		created.reloadable = reloadable;
+		REGISTRY.put(capeId, created);
+		return created;
+	}
+
+	private static AnimatedCapeAsset create(String id, GifDecoder.Result decoded) throws IOException {
+		if (decoded.frames().isEmpty()) {
+			throw new IOException("GIF has no frames");
+		}
+		Identifier textureId = Identifier.of("velo-client", "cape_anim_" + id.replace('-', '_'));
+		NativeImageBackedTexture texture = decoded.width() >= 512 ? new SmoothTexture(() -> "animated cloak " + id, decoded.width(), decoded.height())
+				: new NativeImageBackedTexture(() -> "animated cloak " + id, decoded.width(), decoded.height(), false);
+		MinecraftClient.getInstance().getTextureManager().registerTexture(textureId, texture);
+		CapeManager.noteTextureSize(textureId, decoded.width(), decoded.height());
+		// Frames only cover the used part of the layout (see GifDecoder#capeRegion): the rest stays transparent.
+		texture.getImage().fillRect(0, 0, decoded.width(), decoded.height(), 0);
+		AnimatedCapeAsset animated = new AnimatedCapeAsset(textureId, texture, decoded.frames(), decoded.width(), decoded.height());
+		animated.applyFrame(0);
+		return animated;
+	}
+
+	/**
+	 * HD capes (16 texels per cape pixel) are painted art, not pixel art: sampled bilinearly they stay smooth at every
+	 * size, where nearest sampling turned them jagged and shimmering when drawn smaller than the texture.
+	 */
+	public static final class SmoothTexture extends NativeImageBackedTexture {
+		SmoothTexture(java.util.function.Supplier<String> name, int width, int height) {
+			super(name, width, height, false);
+			smooth();
+		}
+
+		/** A finished picture, sampled smoothly (Chain Wings' painted atlas). */
+		public SmoothTexture(java.util.function.Supplier<String> name, NativeImage image) {
+			//? if <1.21.2 {
+			/*super(image);
+			*///?} else {
+			super(name, image);
+			//?}
+			smooth();
+		}
+
+		private void smooth() {
+			//? if <1.21.11 {
+			/*setFilter(true, false); // 1.21.10: no sampler cache yet
+			*///?} else if <26.1 {
+			this.sampler = com.mojang.blaze3d.systems.RenderSystem.getSamplerCache().get(com.mojang.blaze3d.textures.FilterMode.LINEAR);
+			//?} else {
+			/*this.sampler = com.mojang.blaze3d.systems.RenderSystem.getSamplerCache().getClampToEdge(com.mojang.blaze3d.textures.FilterMode.LINEAR);
+			*///?}
+		}
+	}
+
+	public Identifier identifier() {
+		return identifier;
+	}
+
+	/** A texture of this cape's art laid out for elytra wings, kept in step with the animation. */
+	public synchronized Identifier elytraIdentifier() {
+		long now = System.nanoTime();
+		lastUsedNanos = now;
+		boolean stale = now - elytraUsedNanos > 1_000_000_000L;
+		elytraUsedNanos = now;
+		if (elytraId != null && stale) {
+			paintElytra(Math.max(frameIndex, 0));
+		}
+		if (elytraId == null) {
+			elytraId = Identifier.of(identifier.getNamespace(), identifier.getPath().replace("cape_anim_", "elytra_anim_"));
+			elytraTexture = new NativeImageBackedTexture(() -> "animated elytra " + elytraId, ElytraArt.WIDTH, ElytraArt.HEIGHT, false);
+			MinecraftClient.getInstance().getTextureManager().registerTexture(elytraId, elytraTexture);
+			paintElytra(Math.max(frameIndex, 0));
+		}
+		return elytraId;
+	}
+
+	/** The already-registered animated cape for {@code capeId}, or null. */
+	public static synchronized AnimatedCapeAsset existing(String capeId) {
+		AnimatedCapeAsset asset = REGISTRY.get(capeId);
+		if (asset != null) {
+			asset.lastUsedNanos = System.nanoTime();
+		}
+		return asset;
+	}
+
+	private void paintElytra(int index) {
+		// (Named "texture" on purpose: the 26.x port rewrites "texture.getImage(" - see stonecutter.gradle.kts.)
+		NativeImageBackedTexture texture = elytraTexture;
+		if (texture != null) {
+			ElytraArt.compose(frames.get(index).image(), texture.getImage());
+			texture.upload();
+		}
+	}
+
+	public int width() {
+		return width;
+	}
+
+	public int height() {
+		return height;
+	}
+
+	/**
+	 * Advances every animated cape that's actually being drawn (asked for within the last second)
+	 * by real elapsed time. Store previews, other players' capes out of view etc. stay registered
+	 * but frozen - each frame change is a full texture upload, and uploading capes nobody can see
+	 * 20 times a second was wasted GPU bandwidth.
+	 */
+	private static volatile boolean qualityChanged;
+
+	/** Cosmetics Quality changed: cloaks that can be decoded again are, at the new resolution (on their next draw). */
+	public static void qualityChanged() {
+		qualityChanged = true;
+	}
+
+	public static synchronized void tickAll() {
+		long now = System.nanoTime();
+		if (qualityChanged) {
+			qualityChanged = false;
+			releaseIdle(0);
+		}
+		// Every frame of a GIF is kept decoded in native memory (a large animated cape is tens of
+		// MB). Browsing the store used to keep every cape ever previewed for the rest of the
+		// session; ones that can be decoded again are freed after a minute of not being drawn.
+		releaseIdle(60_000);
+		CapeManager.preloadEquipped();
+		for (var entry : REGISTRY.entrySet()) {
+			AnimatedCapeAsset texture = entry.getValue();
+			texture.owned = CapeManager.pinned(entry.getKey());
+			if (now - texture.lastUsedNanos > 1_000_000_000L) {
+				texture.lastAdvanceNanos = now;
+				continue;
+			}
+			texture.advance(now);
+		}
+	}
+
+	/** Drops the decoded texture of {@code capeId} (its art changed), so the next draw decodes the new art. Render thread. */
+	public static synchronized void forget(String capeId) {
+		AnimatedCapeAsset asset = REGISTRY.remove(capeId);
+		if (asset != null) {
+			asset.release();
+		}
+	}
+
+	/** Frees re-decodable capes not drawn for {@code idleMillis}. Render thread. */
+	public static synchronized void releaseIdle(long idleMillis) {
+		long now = System.nanoTime();
+		var it = REGISTRY.entrySet().iterator();
+		while (it.hasNext()) {
+			var entry = it.next();
+			AnimatedCapeAsset asset = entry.getValue();
+			if (asset.reloadable && now - asset.lastUsedNanos > idleMillis * 1_000_000L && !CapeManager.pinned(entry.getKey())) {
+				it.remove();
+				asset.release();
+			}
+		}
+	}
+
+	private void release() {
+		MinecraftClient.getInstance().getTextureManager().destroyTexture(identifier);
+		if (elytraId != null) {
+			MinecraftClient.getInstance().getTextureManager().destroyTexture(elytraId);
+		}
+		for (GifDecoder.Frame frame : frames) {
+			frame.image().close();
+		}
+	}
+
+	private void advance(long nowNanos) {
+		if (lastAdvanceNanos < 0) {
+			lastAdvanceNanos = nowNanos;
+			return;
+		}
+		long elapsedMs = (nowNanos - lastAdvanceNanos) / 1_000_000L;
+		lastAdvanceNanos = nowNanos;
+		if (elapsedMs <= 0) {
+			return;
+		}
+		msIntoCurrentFrame += elapsedMs;
+		// Cosmetics Quality: frame changes (each a texture upload) at most every so often - except your own cloak.
+		long minGap = owned ? 0 : net.veloclient.velo.client.modules.performance.CosmeticsQualityModule.otherCapeFrameNanos();
+		if (minGap > 0 && nowNanos - lastFrameChangeNanos < minGap) {
+			return;
+		}
+		int index = Math.max(frameIndex, 0);
+		int currentDelay = Math.max(1, frames.get(index).delayMillis());
+		int guard = 0;
+		while (msIntoCurrentFrame >= currentDelay && guard++ < frames.size()) {
+			msIntoCurrentFrame -= currentDelay;
+			index = (index + 1) % frames.size();
+			currentDelay = Math.max(1, frames.get(index).delayMillis());
+		}
+		// Only the frame we land on is copied + uploaded - after a hitch several frames can elapse
+		// in one tick, and uploading each skipped one (a full texture upload each, 4 MB+ for a
+		// large cape) just made the hitch worse.
+		if (index != frameIndex) {
+			lastFrameChangeNanos = nowNanos;
+			applyFrame(index);
+		}
+	}
+
+	private void applyFrame(int index) {
+		frameIndex = index;
+		NativeImage frame = frames.get(index).image();
+		frame.copyRect(texture.getImage(), 0, 0, 0, 0, Math.min(frame.getWidth(), width), Math.min(frame.getHeight(), height), false, false);
+		texture.upload();
+		if (System.nanoTime() - elytraUsedNanos < 1_000_000_000L) {
+			paintElytra(index);
+		}
+	}
+}
