@@ -53,6 +53,12 @@ public final class Downloader {
 			onBytes.accept(Files.size(dest));
 			return;
 		}
+		// Other launchers on this machine (SKLauncher, the vanilla one) may already
+		// have this exact file - import it (hardlinked) instead of re-downloading.
+		if (ExternalInstalls.importIfAvailable(url, dest, expectedSha1, expectedSize)) {
+			onBytes.accept(Files.size(dest));
+			return;
+		}
 		Files.createDirectories(dest.getParent());
 		Path temp = dest.resolveSibling(dest.getFileName() + ".part");
 		try {

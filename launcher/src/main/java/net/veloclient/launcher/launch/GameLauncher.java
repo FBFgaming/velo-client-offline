@@ -92,13 +92,21 @@ public final class GameLauncher {
 		Path clientJar = GameDataPaths.clientJar(version.id());
 		long clientSize = clientDownload.get("size").getAsLong();
 		AtomicLong clientDone = new AtomicLong();
-		Downloader.ensure(URI.create(clientDownload.get("url").getAsString()), clientJar,
-				clientDownload.get("sha1").getAsString(), clientSize,
-				n -> {
-					long now = clientDone.addAndGet(n);
-					listener.onProgress(Math.min(1.0, now / (double) Math.max(1, clientSize)));
-					listener.onBytes(now, clientSize);
-				});
+		String clientSha1 = clientDownload.has("sha1") ? clientDownload.get("sha1").getAsString() : null;
+		// SKLauncher/vanilla launcher version folders may already hold this exact
+		// jar - import it (hardlinked, sha1-verified) instead of re-downloading ~25 MB.
+		if (ExternalInstalls.importClientJar(version.id(), clientJar, clientSha1, clientSize)) {
+			listener.onProgress(1.0);
+		} else {
+			String effectiveSha1 = clientSha1;
+			Downloader.ensure(URI.create(clientDownload.get("url").getAsString()), clientJar,
+					effectiveSha1, clientSize,
+					n -> {
+						long now = clientDone.addAndGet(n);
+						listener.onProgress(Math.min(1.0, now / (double) Math.max(1, clientSize)));
+						listener.onBytes(now, clientSize);
+					});
+		}
 
 		listener.onPhase("Downloading assets...");
 		var indexInfo = AssetInstaller.readAssetIndexInfo(vanilla);
