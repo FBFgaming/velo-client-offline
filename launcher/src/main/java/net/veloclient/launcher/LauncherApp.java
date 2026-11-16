@@ -69,6 +69,8 @@ import net.veloclient.launcher.ui.ServerEditDialog;
 import net.veloclient.launcher.ui.ServerFaviconCache;
 import net.veloclient.launcher.ui.SignInDialog;
 import net.veloclient.launcher.ui.ThemeEditorView;
+import net.veloclient.launcher.launch.ExternalInstalls;
+import net.veloclient.launcher.launch.SklauncherInstanceImporter;
 
 import java.io.IOException;
 import java.nio.file.Files;
@@ -438,6 +440,8 @@ public final class LauncherApp extends Application {
 		if (autoLaunch != null && !autoLaunch.isBlank()) {
 			autoLaunch(autoLaunch, 0);
 		}
+		// Pick up instances created by other launchers (SKLauncher etc.) once at startup - idempotent.
+		importSklauncherInstances();
 	}
 
 	/**
@@ -466,6 +470,22 @@ public final class LauncherApp extends Application {
 			launchWithProgress(instance, null, launchBar.playButton(), launchBar.progress(), launchBar.statusLabel());
 		});
 		wait.play();
+	}
+
+	/** Scans SKLauncher's instances directory and imports any instances found into Velo's InstanceStore. */
+	private void importSklauncherInstances() {
+		try {
+			int count = SklauncherInstanceImporter.importInstances();
+			if (count > 0) {
+				LauncherLog.info(count + " SKLauncher instance(s) imported.");
+				// Refresh the home screen to show new instances
+				if (activePage.equals("home")) {
+					showHome();
+				}
+			}
+		} catch (Exception e) {
+			LauncherLog.warn("Failed to import SKLauncher instances", e);
+		}
 	}
 
 	/**
@@ -1047,6 +1067,7 @@ public final class LauncherApp extends Application {
 						(Runnable) () -> net.veloclient.launcher.ui.BugReportDialog.show(stage), "bug"},
 				{"Themes", "Settings · colors", "theme colors appearance custom", (Runnable) this::showThemeEditor, "palette"},
 				{"Switch from another client", "Import keybinds, servers, mods", "lunar dawn feather modrinth curseforge import", (Runnable) this::showClientImport, "swap"},
+				{"Import SKLauncher Instances", "Import from .sklauncher", "import instances from SKLauncher", (Runnable) this::importSklauncherInstances, "swap"},
 				{"New profile", "Create a profile", "create add instance", (Runnable) this::createNewProfile, "plus"},
 				{"My profile", "Account", "account player stats", (Runnable) () -> { if (session != null) { showAccountProfile(); } else { beginSignIn(); } }, "user"},
 		};

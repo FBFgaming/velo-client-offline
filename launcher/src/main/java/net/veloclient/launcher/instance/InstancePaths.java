@@ -3,6 +3,7 @@ package net.veloclient.launcher.instance;
 import net.veloclient.launcher.data.VeloPaths;
 
 import java.io.IOException;
+import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 
@@ -13,6 +14,8 @@ import java.nio.file.Path;
  * are shared across instances, see {@link net.veloclient.launcher.launch.GameDataPaths}.
  */
 public final class InstancePaths {
+
+	private static final String EXTERNAL_MARKER = "external-gamedir.txt";
 
 	private InstancePaths() {
 	}
@@ -33,9 +36,44 @@ public final class InstancePaths {
 		return dir(instanceId).resolve("icon.png");
 	}
 
-	/** The instance's Minecraft game directory: mods/saves/config/logs all live directly under this. */
+	/**
+	 * The instance's Minecraft game directory: mods/saves/config/logs all live directly under this.
+	 * Instances imported from other launchers point this at the original folder (marker file
+	 * {@code external-gamedir.txt} in the Velo-side instance dir), so the pack's own mods, saves
+	 * and config are used in place - nothing is copied or duplicated.
+	 */
 	public static Path gameDir(String instanceId) {
-		return dir(instanceId);
+		Path external = externalGameDir(instanceId);
+		return external != null ? external : dir(instanceId);
+	}
+
+	/** @return the external game dir this instance was imported from, or {@code null} if it uses its own Velo folder. */
+	public static Path externalGameDir(String instanceId) {
+		Path marker = dir(instanceId).resolve(EXTERNAL_MARKER);
+		if (!Files.isRegularFile(marker)) {
+			return null;
+		}
+		try {
+			String raw = Files.readString(marker, StandardCharsets.UTF_8).strip();
+			if (raw.isEmpty()) {
+				return null;
+			}
+			Path external = Path.of(raw);
+			return Files.isDirectory(external) ? external : null;
+		} catch (IOException e) {
+			return null;
+		}
+	}
+
+	/** Points this instance's game directory at {@code external} (an existing folder) instead of its own Velo folder. */
+	public static void setExternalGameDir(String instanceId, Path external) {
+		try {
+			Files.createDirectories(dir(instanceId));
+			Files.writeString(dir(instanceId).resolve(EXTERNAL_MARKER),
+					external.toAbsolutePath().normalize().toString() + "\n", StandardCharsets.UTF_8);
+		} catch (IOException e) {
+			throw new RuntimeException("Failed to record external game dir for " + instanceId, e);
+		}
 	}
 
 	public static Path modsDir(String instanceId) {

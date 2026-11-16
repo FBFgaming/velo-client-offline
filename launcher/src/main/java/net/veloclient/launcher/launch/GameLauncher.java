@@ -69,7 +69,10 @@ public final class GameLauncher {
 		// The same profile may already be running (e.g. a second account on it). Its mods and
 		// natives are in use then - and on Windows locked - so leave them exactly as they are.
 		boolean alreadyRunning = net.veloclient.launcher.instance.RunningInstanceManager.countRunning(instance.id()) > 0;
-		if (!alreadyRunning) {
+		// Instances imported from other launchers (external game dir) run the pack's own mods
+		// exactly as they were - installing Velo's recommended mods on top could conflict.
+		boolean externalGameDir = InstancePaths.externalGameDir(instance.id()) != null;
+		if (!alreadyRunning && !externalGameDir) {
 			GameJars.installInto(modsDir, version);
 			FabricApiInstaller.installInto(modsDir, version);
 			listener.onPhase("Checking recommended mods...");
