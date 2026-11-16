@@ -54,6 +54,24 @@ gradle.bat :launcher:run           # run the launcher from source
 `gradle.bat` directly avoids it. A full installer build (`:launcher:jpackageDist`) also
 bundles the per-version client jars and needs the whole monorepo built - much heavier.
 
+### Portable build without WiX (Windows)
+
+`:launcher:jpackageDist` produces an `.exe` setup, which needs WiX Toolset. Without
+it, you can still get a one-click portable build with jpackage alone: stage the
+runtime classpath + launcher jar into one folder (like `jpackageDist` does), then:
+
+```bat
+jpackage --type app-image --input <staging> --dest <dist> ^
+  --name "Velo Client Launcher" --main-jar launcher.jar ^
+  --main-class net.veloclient.launcher.LauncherApp --icon Logo.ico ^
+  --add-modules ALL-MODULE-PATH  (plus the same --java-options as jpackageDist)
+```
+
+That yields `dist\Velo Client Launcher\Velo Client Launcher.exe` - a self-contained
+folder with a bundled runtime; double-click runs it, nothing to install. It needs a
+JDK with `jmods` on hand to build the bundled runtime (Corretto/standard JDK zips;
+an Adoptium zip without `jmods` fails jlink).
+
 ## Not included (deliberately)
 
 Nothing here spoofs premium sessions or Mojang's auth servers: an offline account can
