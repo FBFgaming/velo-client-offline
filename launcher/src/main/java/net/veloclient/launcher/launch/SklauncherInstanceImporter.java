@@ -164,6 +164,33 @@ public final class SklauncherInstanceImporter {
 		return new Instance(id, name, mcVersion, icon, created);
 	}
 
+	/**
+	 * Imports one arbitrary Minecraft game folder (picked by the user in a folder chooser) the same
+	 * way {@link #importInstances()} imports the well-known launcher roots: the folder becomes the
+	 * instance's external game dir, version detected from its mods/filenames.
+	 *
+	 * @return the created instance, or {@code null} if {@code folder} isn't a game dir with a detectable version
+	 */
+	public static Instance importFolder(Path folder) {
+		if (folder == null || !Files.isDirectory(folder)) {
+			return null;
+		}
+		String id = folder.getFileName().toString();
+		List<String> taken = InstanceStore.loadAll().stream().map(Instance::id).toList();
+		String unique = id;
+		int suffix = 2;
+		while (taken.contains(unique)) {
+			unique = id + "-" + suffix++;
+		}
+		Instance instance = instanceFromFolder(folder, unique, id);
+		if (instance == null) {
+			return null;
+		}
+		InstancePaths.setExternalGameDir(unique, folder);
+		InstanceStore.save(instance);
+		return instance;
+	}
+
 	private record Candidate(String id, String name, Path folder) {
 	}
 
