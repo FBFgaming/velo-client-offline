@@ -7,6 +7,7 @@ import javafx.scene.Scene;
 import javafx.scene.control.Button;
 import javafx.scene.control.Label;
 import javafx.scene.control.ProgressIndicator;
+import javafx.scene.control.TextField;
 import javafx.scene.input.Clipboard;
 import javafx.scene.input.ClipboardContent;
 import javafx.scene.layout.HBox;
@@ -18,10 +19,12 @@ import javafx.stage.StageStyle;
 import net.veloclient.launcher.auth.AuthException;
 import net.veloclient.launcher.auth.MicrosoftAuth;
 import net.veloclient.launcher.auth.MinecraftSession;
+import net.veloclient.launcher.auth.OfflineAuth;
 
 import java.awt.Desktop;
 import java.net.URI;
 import java.util.concurrent.Executors;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Consumer;
 
 /**
@@ -29,6 +32,11 @@ import java.util.function.Consumer;
  * copied automatically FIRST, and the Microsoft page only opens when the user clicks "Open login
  * page" - opening it straight away (the old behaviour) meant many people never saw the code and
  * went looking for a 2FA code in their email/phone instead.
+ *
+ * <p>The same dialog also carries the offline option: a footer link swaps onto a username-only
+ * panel ({@link OfflineAuth}) for people without a Microsoft account, so "sign in" always has a
+ * way in. The Microsoft flow keeps polling in the background until the user switches (it is
+ * cancelled then), so backing out of the offline panel just restarts it.
  */
 public final class SignInDialog {
 
@@ -51,6 +59,9 @@ public final class SignInDialog {
 		final Button copyLink = new Button("Copy link");
 		final ProgressIndicator spinner = new ProgressIndicator();
 		final Label[] steps = new Label[3];
+		final Button offlineLink = new Button("No Microsoft account? Play with an offline username instead");
+		/** The Microsoft-flow card, kept so the offline panel can swap back to it. */
+		VBox box;
 		String url = LOGIN_URL_FALLBACK;
 
 		View(Stage stage) {
@@ -83,61 +94,117 @@ public final class SignInDialog {
 	}
 
 	public static void show(Stage owner, String clientId, Consumer<MinecraftSession> onSuccess, Consumer<String> onError) {
+		open(owner, clientId, onSuccess, onError, false);
+	}
+
+	/** Opens straight onto the offline panel (the account menu's "Add offline account"). */
+	public static void showOffline(Stage owner, String clientId, Consumer<MinecraftSession> onSuccess, Consumer<String> onError) {
+		open(owner, clientId, onSuccess, onError, true);
+	}
+
+	private static void open(Stage owner, String clientId, Consumer<MinecraftSession> onSuccess, Consumer<String> onError,
+			boolean startOffline) {
 		View view = build(owner);
 
 		var executor = Executors.newVirtualThreadPerTaskExecutor();
-		var future = executor.submit(() -> {
-			try {
-				MicrosoftAuth auth = new MicrosoftAuth(clientId);
-				MinecraftSession session = auth.signInWithDeviceCode(deviceCode -> Platform.runLater(() -> {
-					view.fill(deviceCode.userCode(), deviceCode.verificationUri());
-					view.copy.setOnAction(e -> {
-						copyToClipboard(deviceCode.userCode());
-						view.copied.setText("Copied again");
-						pop(view.copied);
+		// Held in a reference so the offline panel (and Back) can cancel or restart the polling.
+		AtomicReference<java.util.concurrent.Future<?>> microsoftFlow = new AtomicReference<>();
+		Runnable startMicrosoftFlow = () -> {
+			view.status.setText("Requesting a sign-in code...");
+			view.code.setText("· · · · · · · ·");
+			view.copied.setText("");
+			view.setStep(0);
+			microsoftFlow.set(executor.submit(() -> {
+				try {
+					MicrosoftAuth auth = new MicrosoftAuth(clientId);
+					MinecraftSession session = auth.signInWithDeviceCode(deviceCode -> Platform.runLater(() -> {
+						view.fill(deviceCode.userCode(), deviceCode.verificationUri());
+						view.copy.setOnAction(e -> {
+							copyToClipboard(deviceCode.userCode());
+							view.copied.setText("Copied again");
+							pop(view.copied);
+						});
+					}));
+					Platform.runLater(() -> {
+						view.stage.close();
+						// Whatever the page refresh after sign-in throws must not look like a failed sign-in crash:
+						// the session is already valid at this point.
+						try {
+							onSuccess.accept(session);
+						} catch (RuntimeException e) {
+							net.veloclient.launcher.LauncherLog.warn("After sign-in", e);
+						}
 					});
-				}));
-				Platform.runLater(() -> {
-					view.stage.close();
-					// Whatever the page refresh after sign-in throws must not look like a failed sign-in crash:
-					// the session is already valid at this point.
-					try {
-						onSuccess.accept(session);
-					} catch (RuntimeException e) {
-						net.veloclient.launcher.LauncherLog.warn("After sign-in", e);
+				} catch (AuthException e) {
+					if (Thread.currentThread().isInterrupted()) {
+						return; // Cancelled by the user - no "Sign-in failed" popup.
 					}
-				});
-			} catch (AuthException e) {
-				if (Thread.currentThread().isInterrupted()) {
-					return; // Cancelled by the user - no "Sign-in failed" popup.
+					Platform.runLater(() -> {
+						view.stage.close();
+						onError.accept(e.getMessage());
+					});
+				} catch (Throwable e) {
+					if (Thread.currentThread().isInterrupted()) {
+						return;
+					}
+					net.veloclient.launcher.LauncherLog.warn("Sign-in failed", e);
+					Platform.runLater(() -> {
+						view.stage.close();
+						onError.accept("Unexpected error: " + e);
+					});
 				}
-				Platform.runLater(() -> {
-					view.stage.close();
-					onError.accept(e.getMessage());
-				});
-			} catch (Throwable e) {
-				if (Thread.currentThread().isInterrupted()) {
-					return;
-				}
-				net.veloclient.launcher.LauncherLog.warn("Sign-in failed", e);
-				Platform.runLater(() -> {
-					view.stage.close();
-					onError.accept("Unexpected error: " + e);
-				});
+			}));
+		};
+
+		VBox offlinePanel = buildOfflinePanel(owner, session -> {
+			java.util.concurrent.Future<?> ms = microsoftFlow.get();
+			if (ms != null) {
+				ms.cancel(true); // Silent - the flow's own interrupt checks swallow it.
 			}
+			view.stage.close();
+			try {
+				onSuccess.accept(session);
+			} catch (RuntimeException e) {
+				net.veloclient.launcher.LauncherLog.warn("After offline sign-in", e);
+			}
+		}, () -> {
+			view.stage.getScene().setRoot(view.box);
+			startMicrosoftFlow.run();
+		});
+		view.offlineLink.setOnAction(e -> {
+			java.util.concurrent.Future<?> ms = microsoftFlow.get();
+			if (ms != null) {
+				ms.cancel(true);
+			}
+			view.stage.getScene().setRoot(offlinePanel);
 		});
 
 		view.cancel.setOnAction(e -> {
-			future.cancel(true);
+			java.util.concurrent.Future<?> ms = microsoftFlow.get();
+			if (ms != null) {
+				ms.cancel(true);
+			}
 			view.stage.close();
 		});
-		view.stage.setOnCloseRequest(e -> future.cancel(true));
+		view.stage.setOnCloseRequest(e -> {
+			java.util.concurrent.Future<?> ms = microsoftFlow.get();
+			if (ms != null) {
+				ms.cancel(true);
+			}
+		});
 		view.stage.show();
+
+		if (startOffline) {
+			view.stage.getScene().setRoot(offlinePanel);
+		} else {
+			startMicrosoftFlow.run();
+		}
 	}
 
 	/** Dev-only preview (launcher screenshot tour): the dialog with a sample code, no network. */
 	public static void demo(Stage owner, Object ignoredTheme) {
 		View view = build(owner);
+		view.offlineLink.setDisable(true);
 		view.cancel.setOnAction(e -> view.stage.close());
 		view.stage.show();
 		javafx.animation.PauseTransition later = new javafx.animation.PauseTransition(javafx.util.Duration.millis(500));
@@ -241,6 +308,10 @@ public final class SignInDialog {
 		// Same theme colors as the main window (its root carries them as inline lookups).
 		box.setStyle(owner.getScene().getRoot().getStyle());
 
+		view.offlineLink.getStyleClass().add("signin-offline-link");
+		box.getChildren().add(view.offlineLink);
+		view.box = box;
+
 		Scene scene = new Scene(box);
 		scene.setFill(Color.TRANSPARENT);
 		scene.getStylesheets().addAll(owner.getScene().getStylesheets());
@@ -261,6 +332,80 @@ public final class SignInDialog {
 			new javafx.animation.ParallelTransition(fade, grow).play();
 		});
 		return view;
+	}
+
+	/**
+	 * The offline panel: a username is enough - the session's UUID is Minecraft's own offline-mode
+	 * derivation ({@code UUID.nameUUIDFromBytes("OfflinePlayer:" + name)}), the same value an
+	 * offline-mode vanilla server assigns. Same card look as the Microsoft flow.
+	 */
+	private static VBox buildOfflinePanel(Stage owner, Consumer<MinecraftSession> onContinue, Runnable backToMicrosoft) {
+		VBox panel = new VBox(16);
+		panel.setAlignment(Pos.TOP_CENTER);
+		panel.setPadding(new Insets(28));
+		panel.getStyleClass().add("signin-dialog");
+		panel.setPrefWidth(440);
+		panel.setStyle(owner.getScene().getRoot().getStyle());
+
+		Label heading = new Label("Play offline");
+		heading.getStyleClass().add("signin-heading");
+		Label sub = new Label("A username-only account, exactly how Minecraft's own offline mode works.");
+		sub.getStyleClass().add("signin-sub");
+		sub.setWrapText(true);
+		VBox.setMargin(sub, new Insets(-12, 0, 0, 0));
+
+		Label caption = new Label("USERNAME");
+		caption.getStyleClass().add("signin-caption");
+		TextField name = new TextField();
+		name.setPromptText("3-16 characters - like your in-game name");
+		// Minecraft names cap at 16 characters; typing more would only fail validation later.
+		name.setTextFormatter(new javafx.scene.control.TextFormatter<String>(change ->
+				change.getControlNewText().length() <= 16 ? change : null));
+		name.getStyleClass().add("signin-name-field");
+		VBox nameCard = new VBox(8, caption, name);
+		nameCard.getStyleClass().add("signin-code-card");
+		nameCard.setAlignment(Pos.CENTER_LEFT);
+
+		Label error = new Label();
+		error.getStyleClass().add("signin-sub");
+		error.setStyle("-fx-text-fill: -velo-danger;");
+		error.setWrapText(true);
+		error.setAlignment(Pos.CENTER);
+		error.setVisible(false);
+		error.setManaged(false);
+
+		Button go = new Button("Play offline");
+		go.getStyleClass().add("primary-button");
+		go.setDefaultButton(true);
+		go.setMaxWidth(Double.MAX_VALUE);
+		go.setOnAction(e -> {
+			OfflineAuth.Result result = OfflineAuth.validate(name.getText());
+			if (!result.ok()) {
+				error.setText(result.error());
+				error.setVisible(true);
+				error.setManaged(true);
+				pop(error);
+				return;
+			}
+			onContinue.accept(OfflineAuth.createSession(result.username()));
+		});
+
+		Button back = new Button("Sign in with Microsoft instead");
+		back.getStyleClass().add("ghost-button");
+		back.setMaxWidth(Double.MAX_VALUE);
+		back.setOnAction(e -> backToMicrosoft.run());
+		HBox.setHgrow(go, javafx.scene.layout.Priority.ALWAYS);
+		HBox actions = new HBox(10, back, go);
+		actions.setAlignment(Pos.CENTER);
+
+		Label note = new Label("Works on singleplayer, LAN and servers with online-mode off. Velo Network extras (friends, "
+				+ "parties, cosmetics sync) and premium-only servers need a Microsoft account.");
+		note.getStyleClass().add("signin-note");
+		note.setWrapText(true);
+
+		name.setOnAction(e -> go.fire());
+		panel.getChildren().addAll(heading, sub, nameCard, error, actions, note);
+		return panel;
 	}
 
 	/** A quick scale "pop" to draw the eye to something that just changed. */

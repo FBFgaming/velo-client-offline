@@ -1150,6 +1150,26 @@
 	-fx-font-weight: bold;
 }
 
+/* The sign-in dialog's footer link into the offline panel, and the offline panel's username field. */
+.signin-offline-link {
+	-fx-background-color: transparent;
+	-fx-border-color: transparent;
+	-fx-padding: 4 0 0 0;
+	-fx-text-fill: derive(-velo-text, -25%);
+	-fx-font-size: 12px;
+	-fx-underline: true;
+	-fx-cursor: hand;
+}
+
+.signin-offline-link:hover, .signin-offline-link:pressed {
+	-fx-text-fill: -velo-text;
+}
+
+.signin-name-field {
+	-fx-font-size: 14px;
+	-fx-padding: 8 12 8 12;
+}
+
 /* ---- Profile workspace: pack tabs ---- */
 
 .pack-toolbar {

@@ -145,7 +145,7 @@ public final class AccountProfileView {
 		}
 		Label java = new Label("Java Edition");
 		java.getStyleClass().addAll("badge", "badge-grey");
-		Label microsoft = new Label("Microsoft account");
+		Label microsoft = new Label(session.isOffline() ? "Offline account" : "Microsoft account");
 		microsoft.getStyleClass().addAll("badge", "badge-grey");
 		badges.getChildren().addAll(java, microsoft);
 		long since = PlayTimeStore.get().firstRecordedEpochMillis;

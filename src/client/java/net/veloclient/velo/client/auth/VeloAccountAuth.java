@@ -86,6 +86,10 @@ public final class VeloAccountAuth {
 				break;
 			}
 		}
+		if (activeAccount.has("offline") && activeAccount.get("offline").getAsBoolean()) {
+			// The launcher's offline accounts carry no Microsoft tokens at all - no refresh can produce a real session.
+			throw new AuthRefreshException("This is an offline account - it can't join servers that check for a real Minecraft account.");
+		}
 		if (activeAccount == null || !activeAccount.has("microsoftRefreshToken")
 				|| activeAccount.get("microsoftRefreshToken").isJsonNull()) {
 			throw new AuthRefreshException("Saved Velo account has no refresh token - sign in again via the launcher.");

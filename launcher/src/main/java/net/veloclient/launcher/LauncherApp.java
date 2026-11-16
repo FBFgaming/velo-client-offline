@@ -1456,7 +1456,7 @@ public final class LauncherApp extends Application {
 		VBox list = new VBox(2);
 		javafx.stage.Popup[] popup = new javafx.stage.Popup[1];
 		if (session == null) {
-			list.getChildren().add(notificationRow("user", "#FF7A7E", "Sign in with Microsoft", "Needed to play and sync cosmetics", () -> {
+			list.getChildren().add(notificationRow("user", "#FF7A7E", "Sign in to play", "Microsoft account, or an offline username", () -> {
 				popup[0].hide();
 				beginSignIn();
 			}));
@@ -1493,7 +1493,7 @@ public final class LauncherApp extends Application {
 			list.getChildren().add(header);
 			for (MinecraftSession account : accounts) {
 				boolean active = session != null && session.uuid().equals(account.uuid());
-				Label accountName = new Label(account.username());
+				Label accountName = new Label(account.isOffline() ? account.username() + " (offline)" : account.username());
 				accountName.getStyleClass().add("t-strong");
 				HBox.setHgrow(accountName, Priority.ALWAYS);
 				accountName.setMaxWidth(Double.MAX_VALUE);
@@ -1515,6 +1515,12 @@ public final class LauncherApp extends Application {
 		list.getChildren().add(menuRow("plus", "Add account", () -> {
 			popup[0].hide();
 			beginSignIn();
+		}));
+		list.getChildren().add(menuRow("user", "Add offline account", () -> {
+			popup[0].hide();
+			SignInDialog.showOffline(stage, MICROSOFT_CLIENT_ID,
+					this::onSignedIn,
+					error -> showPlaceholderAlert("Sign-in failed", error));
 		}));
 		if (session != null) {
 			HBox signOutRow = menuRow("logout", "Sign out", () -> {
@@ -5583,7 +5589,9 @@ public final class LauncherApp extends Application {
 			Button signOutButton = new Button("Sign out");
 			signOutButton.getStyleClass().add("danger-ghost-button");
 			signOutButton.setOnAction(e -> signOut());
-			net.veloclient.launcher.ui.SettingsUi.row(account, session.username(), "Microsoft account", "UUID " + session.uuid(), signOutButton);
+			net.veloclient.launcher.ui.SettingsUi.row(account, session.username(),
+					session.isOffline() ? "Offline account" : "Microsoft account",
+					session.isOffline() ? "Offline username · UUID " + session.uuid() : "UUID " + session.uuid(), signOutButton);
 			// velo-client.com: a short code to type on the website signs you in to the web Store.
 			Label webCode = new Label("");
 			webCode.setStyle("-fx-font-family: 'Geist Mono'; -fx-font-size: 18px; -fx-font-weight: bold; -fx-text-fill: -velo-text;");

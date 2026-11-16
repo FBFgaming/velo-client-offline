@@ -203,6 +203,14 @@ public final class LauncherSocial {
 			publish(new Event("state", null, null, null, null));
 			return;
 		}
+		if (newSession.isOffline()) {
+			// An offline account has no real Minecraft token, so the server could never verify it -
+			// don't even start the worker (it would retry a doomed handshake every few seconds).
+			status = "Offline account - Velo Network needs a Microsoft sign-in";
+			stopWorker();
+			publish(new Event("state", null, null, null, null));
+			return;
+		}
 		if (worker == null) {
 			running = true;
 			worker = Thread.ofPlatform().daemon().name("velo-launcher-social").start(LauncherSocial::loop);
@@ -384,6 +392,10 @@ public final class LauncherSocial {
 		MinecraftSession current = session;
 		if (current == null) {
 			throw new IllegalStateException("not signed in");
+		}
+		if (current.isOffline()) {
+			status = "Offline account - Velo Network needs a Microsoft sign-in";
+			throw new IllegalStateException("offline account");
 		}
 		// Launchers stay open for days (tray, PC asleep overnight): the 24 h Minecraft token runs out and the
 		// connection - and with it website/staff sign-in codes - used to stay dead until a restart.

@@ -175,7 +175,9 @@ public final class GameLauncher {
 		values.put("auth_access_token", session.minecraftAccessToken());
 		values.put("auth_xuid", "");
 		values.put("clientid", "");
-		values.put("user_type", "msa");
+		// "legacy" is what every launcher passes for offline accounts (vanilla servers in offline mode never
+		// consult the session server; a fake "msa" would be a lie the game's own profile loader trips over).
+		values.put("user_type", session.isOffline() ? "legacy" : "msa");
 		values.put("version_type", vanilla.has("type") ? vanilla.get("type").getAsString() : "release");
 		values.put("natives_directory", nativesDir.toAbsolutePath().toString());
 		values.put("launcher_name", LAUNCHER_NAME);
