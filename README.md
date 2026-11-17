@@ -4,6 +4,10 @@
 > launcher's game folder as a profile, with a manual version picker when detection fails.
 > Not affiliated with or endorsed by Velo Client. Velo Network features (accounts, cosmetics, store)
 > still require signing in to Velo.
+>
+> Repo size note: upstream's backend seed data (`server/cosmetics-seed`, ~270 MB of cosmetic GIFs)
+> is omitted from this fork's git history so the repo stays cloneable — the launcher and client
+> don't need it. Find it in upstream if you ever run Velo's own backend.
 
 <p align="center"><img src="velo-site/assets/logo.png" width="120" alt="Velo Client logo"></p>
 
