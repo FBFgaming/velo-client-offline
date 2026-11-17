@@ -172,23 +172,47 @@ public final class SklauncherInstanceImporter {
 	 * @return the created instance, or {@code null} if {@code folder} isn't a game dir with a detectable version
 	 */
 	public static Instance importFolder(Path folder) {
+		return importFolder(folder, null);
+	}
+
+	/**
+	 * @param versionOverride when non-null, used instead of detecting the version from the folder's
+	 *                        contents - for folders that don't reveal one; the user picked it in the UI.
+	 * @return the created instance, or {@code null} if the folder isn't usable (missing/version undetectable)
+	 */
+	public static Instance importFolder(Path folder, String versionOverride) {
 		if (folder == null || !Files.isDirectory(folder)) {
 			return null;
 		}
 		String id = folder.getFileName().toString();
-		List<String> taken = InstanceStore.loadAll().stream().map(Instance::id).toList();
-		String unique = id;
-		int suffix = 2;
-		while (taken.contains(unique)) {
-			unique = id + "-" + suffix++;
+		String unique = uniqueId(id);
+		String version = versionOverride;
+		if (version == null) {
+			version = versionFromFolder(folder);
+			if (version == null) {
+				LauncherLog.info("No Minecraft version detectable in " + folder);
+				return null;
+			}
 		}
-		Instance instance = instanceFromFolder(folder, unique, id);
-		if (instance == null) {
+		if (!isKnownVersion(version)) {
 			return null;
 		}
+		Instance instance = new Instance(unique, id, version, InstanceIcon.builtin(BuiltinIcons.DEFAULT),
+				-System.currentTimeMillis(), null, null, null);
 		InstancePaths.setExternalGameDir(unique, folder);
 		InstanceStore.save(instance);
 		return instance;
+	}
+
+	/** A profile id not taken yet: {@code base}, then {@code base-2}, {@code base-3}, ... */
+	private static String uniqueId(String base) {
+		List<String> taken = InstanceStore.loadAll().stream().map(Instance::id).toList();
+		String unique = base;
+		int suffix = 2;
+		while (taken.contains(unique)) {
+			unique = base + "-" + suffix++;
+		}
+		return unique;
 	}
 
 	private record Candidate(String id, String name, Path folder) {

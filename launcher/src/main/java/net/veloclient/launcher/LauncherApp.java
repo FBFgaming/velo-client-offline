@@ -488,30 +488,49 @@ public final class LauncherApp extends Application {
 		}
 	}
 
-	/** "Open any Minecraft folder...": imports an arbitrary game dir the user picked as a new profile. */
+	/** "Import any folder as profile...": imports an arbitrary game dir the user picked as a new profile.
+	 *  Works with any launcher's folders - when the version isn't detectable, the user picks it themselves. */
 	private void importFromFolderPicker() {
 		javafx.stage.DirectoryChooser chooser = new javafx.stage.DirectoryChooser();
-		chooser.setTitle("Select a Minecraft folder (a game dir with mods, saves or a version)");
+		chooser.setTitle("Select any Minecraft game folder (from any launcher)");
 		java.io.File picked = chooser.showDialog(stage);
 		if (picked == null) {
 			return;
 		}
-		Instance instance = null;
+		java.nio.file.Path folder = picked.toPath();
+		Instance imported = null;
 		try {
-			instance = SklauncherInstanceImporter.importFolder(picked.toPath());
+			imported = SklauncherInstanceImporter.importFolder(folder);
 		} catch (Exception e) {
 			LauncherLog.warn("Failed to import selected folder " + picked, e);
 		}
-		if (instance == null) {
-			Alert alert = new Alert(Alert.AlertType.WARNING,
-					"Couldn't detect a Minecraft version in that folder. Mods must carry their version in the filename (e.g. appleskin-fabric-mc1.21.11-3.0.8.jar), or put a version number in the folder name.",
-					ButtonType.OK);
-			alert.setHeaderText("Not a recognizable Minecraft folder");
-			net.veloclient.launcher.ui.DialogStyling.apply(alert);
-			alert.show();
+		if (imported == null) {
+			// Version not detectable from the folder's contents - let the user pick it in the profile dialog.
+			InstanceEditDialog.show(stage, theme, "Import \"" + picked.getName() + "\"", picked.getName(), null,
+					InstanceIcon.builtin(BuiltinIcons.DEFAULT)).ifPresent(result -> {
+				try {
+					Instance instance = SklauncherInstanceImporter.importFolder(folder, result.mcVersion());
+					if (instance != null) {
+						if (!result.name().isBlank()) {
+							instance = new Instance(instance.id(), result.name(), instance.mcVersion(), result.icon(),
+									instance.createdAtEpochMillis(), instance.ramMinMb(), instance.ramMaxMb(),
+									instance.extraJvmArgs());
+							InstanceStore.save(instance);
+						}
+						applyIconChoice(instance, result);
+						LauncherLog.info("Imported folder as profile: " + instance.id() + " (game dir " + picked + ")");
+						homeProfileIndex = 0;
+						showHome();
+					}
+				} catch (Exception e) {
+					LauncherLog.warn("Failed to import selected folder " + picked, e);
+					showPlaceholderAlert("Couldn't import folder", e.getMessage());
+				}
+			});
 			return;
 		}
-		LauncherLog.info("Imported folder as profile: " + instance.id() + " (game dir " + picked + ")");
+		LauncherLog.info("Imported folder as profile: " + imported.id() + " (game dir " + picked + ")");
+		homeProfileIndex = 0;
 		showHome();
 	}
 
@@ -1095,7 +1114,7 @@ public final class LauncherApp extends Application {
 				{"Themes", "Settings · colors", "theme colors appearance custom", (Runnable) this::showThemeEditor, "palette"},
 				{"Switch from another client", "Import keybinds, servers, mods", "lunar dawn feather modrinth curseforge import", (Runnable) this::showClientImport, "swap"},
 				{"Import SKLauncher Instances", "Import from .sklauncher", "import instances from SKLauncher", (Runnable) this::importSklauncherInstances, "swap"},
-				{"Open any Minecraft folder...", "Pick a folder with mods/a version", "browse folder select directory pick installed version", (Runnable) this::importFromFolderPicker, "folder"},
+				{"Import any folder as profile...", "Pick any launcher's game folder", "browse folder select directory pick any launcher installed version import freedom", (Runnable) this::importFromFolderPicker, "folder"},
 				{"New profile", "Create a profile", "create add instance", (Runnable) this::createNewProfile, "plus"},
 				{"My profile", "Account", "account player stats", (Runnable) () -> { if (session != null) { showAccountProfile(); } else { beginSignIn(); } }, "user"},
 		};

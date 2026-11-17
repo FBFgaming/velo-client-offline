@@ -1,3 +1,10 @@
+> **Fork notice:** This is a community fork of [velo345/velo-client](https://github.com/velo345/velo-client) (MIT).
+> It adds offline (username-only) accounts, reuses files and instances downloaded by other launchers
+> (SKLauncher, vanilla `.minecraft` — no re-downloads, no duplicate disk), and can import **any**
+> launcher's game folder as a profile, with a manual version picker when detection fails.
+> Not affiliated with or endorsed by Velo Client. Velo Network features (accounts, cosmetics, store)
+> still require signing in to Velo.
+
 <p align="center"><img src="velo-site/assets/logo.png" width="120" alt="Velo Client logo"></p>
 
 <h1 align="center">Velo Client</h1>
