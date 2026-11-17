@@ -48,6 +48,24 @@ Redstone Mode and 3D wings, capes and auras every Velo player sees.</p>
 
 The launcher, the client and all modules are free. Velo+ (free 7-day trial) and Store cosmetics are optional.
 
+## What works on offline accounts
+
+Everything that is free in Velo works on offline (username-only) accounts — no sign-in needed:
+
+- **All 100+ modules, the HUD editor, themes and profiles** — free, run client-side.
+- **The 8 free kill effects** (Lightning Strike, Color Burst, Soul Implosion, Totem Shatter, Firework Salute,
+  Void Pull, Electric Surge, Confetti Rain) — equip and recolour them in the Locker; they play client-side.
+- **Your own cape** — import a static PNG/JPG cloak in the Locker (animated GIF cloaks are Velo+).
+- **Clips** — record, trim and export (sharing is Velo+).
+
+What genuinely needs a Microsoft Minecraft account (and why the fork can't change that):
+
+- **Velo Network** (friends, parties, name badges, synced cosmetics) — Velo sign-in proves your Minecraft
+  account against Mojang's session server, which an offline account by definition can't pass.
+- **The Store** (coins, purchases, welcome gift, Velo+ cosmetics) — ownership is recorded on Velo's
+  servers and Velo+ is verified with a signed token, so nothing can be unlocked locally. The fork makes
+  the free tier fully work offline; it does not and cannot unlock paid items.
+
 <p align="center">
   <img src="velo-site/assets/gui/ingame-rshift.webp" width="420" alt="Velo Client mod menu in game">
   <img src="velo-site/assets/gui/locker.webp" width="420" alt="Velo Client cosmetics locker">
